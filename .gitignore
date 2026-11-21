@@ -1,0 +1,18 @@
+# 构建产物
+/target
+dependency-reduced-pom.xml
+*.jar
+
+# IDE
+/.idea
+*.iml
+/.vscode
+/.settings
+/.classpath
+/.project
+
+# JVM 崩溃与重放日志
+# 变异测试会连续跑几十次 mvn，机器内存紧张时 JVM 会 dump 一份 hs_err/replay 到当前目录。
+# 它们含堆栈与环境信息，既不该入库，也会把 git status 搅得没法判读。
+hs_err_pid*.log
+replay_pid*.log

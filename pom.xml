@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>cn.perfscope</groupId>
+    <artifactId>PerfScope-Velocity</artifactId>
+    <!--
+      版本号与主仓 PerfScope 保持一致（基础版本-SNAPSHOT-fixN）。
+
+      两个 artifact 的版本必须同步：协议版本（NetworkSummary.PROTOCOL_VERSION）决定能不能通信，
+      artifact 版本只决定"这是哪一版代码"。它们的对应关系写在 CHANGELOG 里，不靠文件名猜。
+    -->
+    <version>1.4.5-SNAPSHOT-fix1</version>
+    <packaging>jar</packaging>
+
+    <name>PerfScope-Velocity</name>
+    <description>PerfScope 的 Velocity 代理侧：接收各后端上报的性能摘要，一屏看全网</description>
+
+    <licenses>
+        <license>
+            <name>GNU Affero General Public License v3.0</name>
+            <url>https://www.gnu.org/licenses/agpl-3.0.html</url>
+        </license>
+    </licenses>
+
+    <properties>
+        <java.version>17</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- 与主仓同款：固定 jar 条目时间戳，让"同一份源码产出同一份字节"成立 -->
+        <project.build.outputTimestamp>2026-01-01T00:00:00Z</project.build.outputTimestamp>
+        <!--
+          Velocity 3.4.0 是本地离线仓库里已有的版本（~/.m2/repository/com/velocitypowered/velocity-api）。
+
+          注意这里用的是 velocity-api 而不是 velocity-api 的某个服务端版本：插件只编译期依赖它，
+          运行期由代理自己提供（scope=provided）。把 API 打进 jar 会在代理上造成类加载冲突。
+        -->
+        <velocity.version>3.4.0</velocity.version>
+    </properties>
+
+    <repositories>
+        <repository>
+            <id>papermc</id>
+            <url>https://repo.papermc.io/repository/maven-public/</url>
+        </repository>
+    </repositories>
+
+    <dependencies>
+        <!-- Velocity API：编译期用，运行期由代理提供。绝不打进 jar。 -->
+        <dependency>
+            <groupId>com.velocitypowered</groupId>
+            <artifactId>velocity-api</artifactId>
+            <version>${velocity.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+          Gson：序列化跨服摘要。
+
+          为什么在代理侧也用它：主仓（Paper 后端）已经用 Gson 写这条协议，
+          两侧共用同一个序列化库能消掉一整类"格式看起来一样但转义规则不同"的坑。
+          Velocity 自己不带 Gson，所以这里不能用 provided —— 必须 shade 进来。
+          落点用独立前缀 cn.perfscope.velocity.shaded.gson，与主仓的 bstats 落点同款思路。
+        -->
+        <dependency>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+            <version>2.10.1</version>
+            <scope>compile</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.1</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>${project.artifactId}-${project.version}</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <release>${java.version}</release>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.1</version>
+            </plugin>
+            <!--
+              修正 velocity-plugin.json 里的 ${project.version}。
+
+              Velocity 的注解处理器在**编译期**生成 velocity-plugin.json，它把 @Plugin 里的
+              version 字符串原样写进去，不经过 Maven 的 resource filtering —— 于是 jar 里的
+              描述符带着字面量 "${project.version}"。这不是无害的：Velocity 会把它显示成插件
+              版本，`/velocity plugins` 与排错时的版本核对全部拿到这个字符串。
+
+              修法是用 resources filter 在 process-classes 阶段**覆盖**处理器写出的那一份。
+              顺序很重要：必须晚于 compile（处理器在编译期写它），早于 package（jar 要打包它）。
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>3.3.1</version>
+                <executions>
+                    <execution>
+                        <id>filter-velocity-plugin-json</id>
+                        <phase>process-classes</phase>
+                        <goals>
+                            <goal>copy-resources</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.outputDirectory}</outputDirectory>
+                            <resources>
+                                <resource>
+                                    <directory>src/main/resources-filtered</directory>
+                                    <filtering>true</filtering>
+                                </resource>
+                            </resources>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!--
+              shade：把 Gson 打进 jar 并 relocate。
+
+              与主仓的差别：主仓只用 shade 打 bStats（因为它只需要一个自包含遥测库），
+              这里要打 Gson。relocate 是必须的 —— 代理上可能已有别的插件带着不同版本的 Gson，
+              不 relocate 就会撞类。
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.2</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <artifactSet>
+                                <includes>
+                                    <include>com.google.code.gson:gson</include>
+                                </includes>
+                            </artifactSet>
+                            <relocations>
+                                <relocation>
+                                    <pattern>com.google.gson</pattern>
+                                    <shadedPattern>cn.perfscope.velocity.shaded.gson</shadedPattern>
+                                </relocation>
+                            </relocations>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+            </resource>
+        </resources>
+    </build>
+</project>

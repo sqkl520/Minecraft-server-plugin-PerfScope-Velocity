@@ -1,0 +1,10 @@
+{
+  "id": "perfscope",
+  "name": "PerfScope",
+  "version": "${project.version}",
+  "description": "PerfScope 的代理侧：接收各后端上报的性能摘要，一屏看全网",
+  "url": "https://github.com/sqkl520/Minecraft-server-plugin-PerfScope",
+  "authors": ["sqkl520"],
+  "dependencies": [],
+  "main": "cn.perfscope.velocity.PerfScopeVelocity"
+}

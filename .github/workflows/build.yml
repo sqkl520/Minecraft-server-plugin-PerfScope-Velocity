@@ -1,0 +1,143 @@
+# PerfScope-Velocity CI
+#
+# 这个仓库只做一件小事：编译 + 测试 + 校验 jar 描述符。没有服务器、没有 RCON、没有测试脚手架，
+# 所以整个工作流能在 1 分钟内跑完。
+#
+# 两个 job 各自防一类真实事故：
+#   build    -- 在 JDK 17 与 21 上各编译一次。pom 目标是 release 17，在 21 上也编一次能抓到
+#               "只在我这台机器上能编" 的工具链假设，以及 `release` 标志被改坏。
+#   gate     -- 校验 velocity-plugin.json。这个坑真的踩过：注解处理器在编译期生成描述符，
+#               不经过 resource filtering，于是 jar 里是字面量 "${project.version}"。
+#               它不报错，插件照常加载，只是版本那一栏永远是个占位符。
+#               tools/check-velocity-descriptor.mjs 把这条钉住。
+#
+# 署名纪律：任何地方都不出现 AI 署名（项目规则）。
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: build (JDK ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['17', '21']
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: mvn clean package
+        run: mvn -B -ntp clean package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: perfscope-velocity-jdk${{ matrix.java }}
+          path: target/PerfScope-Velocity-*.jar
+          if-no-files-found: error
+          retention-days: 30
+
+  gate:
+    name: descriptor gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build
+        run: mvn -B -ntp clean package -DskipTests
+
+      # 门禁脚本在仓库里（tools/），所以 checkout 之后直接能跑。
+      - name: Verify velocity-plugin.json is resolved
+        run: node tools/check-velocity-descriptor.mjs
+
+  release:
+    name: publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, gate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Rebuild from the tag
+        run: mvn -B -ntp clean package
+
+      - name: Verify tag matches pom version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          POM=$(mvn -B -ntp -q help:evaluate -Dexpression=project.version -DforceStdout)
+          echo "tag=$TAG pom=$POM"
+          if [ "$TAG" != "$POM" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pom version $POM"
+            exit 1
+          fi
+          JAR=$(ls target/PerfScope-Velocity-*.jar | grep -v original | head -n 1)
+          DESC=$(unzip -p "$JAR" velocity-plugin.json)
+          if printf '%s' "$DESC" | grep -q '\${'; then
+            echo '::error::velocity-plugin.json still has a Maven placeholder'
+            exit 1
+          fi
+          if ! printf '%s' "$DESC" | grep -q "\"version\": *\"$TAG\""; then
+            echo "::error::velocity-plugin.json version does not match tag $TAG"
+            printf '%s\n' "$DESC"
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # 标题不带 v，与主仓 PerfScope 的发布格式一致
+          name: ${{ github.ref_name }}
+          files: target/PerfScope-Velocity-*.jar
+          fail_on_unmatched_files: true
+          prerelease: true
+          draft: true
+          generate_release_notes: false
