@@ -38,6 +38,15 @@ public final class NetworkCommand implements SimpleCommand {
             return;
         }
 
+        // /pscope network reset —— 清空已收到的数据（换后端、排查时想让面板从头开始）。
+        // 这是 NetworkView.clear() 的唯一调用点；没有它 clear() 就是死代码，
+        // 连"出问题想重新统计"都做不到。
+        if (args.length > 1 && "reset".equalsIgnoreCase(args[1])) {
+            plugin.view().clear();
+            src.sendMessage(Component.text("已清空已收到的跨服摘要，等待后端重新上报。", NamedTextColor.YELLOW));
+            return;
+        }
+
         long now = System.currentTimeMillis();
         List<NetworkView.Node> nodes = plugin.view().snapshot(now, DEFAULT_PUSH_INTERVAL_SEC, expectedServers());
 
@@ -119,10 +128,17 @@ public final class NetworkCommand implements SimpleCommand {
     @Override
     public boolean hasPermission(Invocation invocation) {
         CommandSource src = invocation.source();
-        // 控制台与持有权限的玩家可以看；玩家默认需要显式授权。
-        if (!(src instanceof Player)) {
+        // 控制台直接放行——但**只认控制台**，不能写成"任何非 Player 都放行"。
+        //
+        // 后者是 fail-open：Velocity 的 API 允许第三方插件构造自己的 CommandSource，
+        // 某个"命令方块 / 脚本引擎"类插件把玩家身份包装成自定义 source 时，
+        // 那个玩家就无条件绕过了权限。按类型白名单才是 fail-closed。
+        if (src instanceof com.velocitypowered.api.proxy.ConsoleCommandSource) {
             return true;
         }
+        // 其余一律查权限。注意：未装权限插件时 Velocity 的 permissionFunction 是
+        // ALWAYS_UNDEFINED，asBoolean() 为 false —— 也就是默认谁都用不了。
+        // 这是正确的保守默认，但部署者必须知道（见 README 的权限一节）。
         return src.hasPermission("perfscope.network");
     }
 

@@ -297,4 +297,155 @@ class SummaryTest {
         }
         throw new AssertionError("node not found: " + id);
     }
+
+    // ==================== 验收修复后新增：防回归 ====================
+
+    @Test
+    @DisplayName("超长 serverId 直接拒（否则撑爆堆、撑爆聊天行）")
+    void rejectsOverlongServerId() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < SummaryPacket.MAX_SERVER_ID_LENGTH + 1; i++) sb.append('a');
+        String json = "{\"v\":1,\"kind\":\"summary\",\"server\":\"" + sb
+            + "\",\"sentAt\":1,\"collectedAt\":1,\"alive\":true}";
+        assertNull(SummaryPacket.parse(json(json)),
+            "超过 " + SummaryPacket.MAX_SERVER_ID_LENGTH + " 字符的 serverId 必须被拒");
+
+        // 边界内的要照常接受（别把闸门做过头）。
+        StringBuilder ok = new StringBuilder();
+        for (int i = 0; i < SummaryPacket.MAX_SERVER_ID_LENGTH; i++) ok.append('a');
+        assertNotNull(SummaryPacket.parse(json("{\"v\":1,\"kind\":\"summary\",\"server\":\"" + ok
+            + "\",\"sentAt\":1,\"collectedAt\":1,\"alive\":true}")));
+    }
+
+    @Test
+    @DisplayName("荒谬的 players 值当作没采到，不显示到面板上")
+    void clampsAbsurdPlayerCounts() {
+        // -99999 不是 -1 哨兵，原样显示会出现"负九万人"
+        assertEquals(-1, SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"a\",\"sentAt\":1,\"collectedAt\":1,"
+                + "\"alive\":true,\"players\":-99999}")).playerCount());
+        // long → int 截断会变成 1，也是假的
+        assertEquals(-1, SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"a\",\"sentAt\":1,\"collectedAt\":1,"
+                + "\"alive\":true,\"players\":4294967297}")).playerCount());
+        // 正常值必须原样保留
+        assertEquals(42, SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"a\",\"sentAt\":1,\"collectedAt\":1,"
+                + "\"alive\":true,\"players\":42}")).playerCount());
+        // 0 是合法读数
+        assertEquals(0, SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"a\",\"sentAt\":1,\"collectedAt\":1,"
+                + "\"alive\":true,\"players\":0}")).playerCount());
+    }
+
+    @Test
+    @DisplayName("条目数有上限，超出时淘汰最久未更新的（防止被灌爆堆）")
+    void capsTrackedServers() {
+        NetworkView view = new NetworkView();
+        int over = NetworkView.MAX_TRACKED_SERVERS + 10;
+        for (int i = 0; i < over; i++) {
+            view.onPacket(okPacket("srv" + i, 1_000L, 20.0, 1));
+        }
+        assertEquals(NetworkView.MAX_TRACKED_SERVERS, view.trackedCount(),
+            "跟踪数必须被限制在 MAX_TRACKED_SERVERS，否则恶意 id 能填满堆");
+        // 最新的一定还在，最老的一定被淘汰了
+        assertTrue(view.knownServers().contains("srv" + (over - 1)), "最新的必须保留");
+        assertFalse(view.knownServers().contains("srv0"), "最久未更新的应被淘汰");
+    }
+
+    @Test
+    @DisplayName("并发安全靠结构保证，不靠压测碰运气")
+    void concurrentSafetyIsStructuralNotProbabilistic() throws Exception {
+        // ⚠️ 这条测试的由来，值得记下来：
+        //
+        // 我先写了一个多线程压测（6 写 × 300 不同 id + 4 读 × 3000 次全量遍历 × 3 轮），
+        // 满以为能抓到"裸 LinkedHashMap"。结果把实现换回裸容器，测试**依然全绿**——
+        // 连跑两轮都没撞出 ConcurrentModificationException。
+        //
+        // 这说明压测路线不可靠：CME 是否出现取决于 JIT、CPU 数、调度时序，
+        // 在别人的机器上红、在我这里是绿的，是最糟的一种测试（比没有更糟，
+        // 因为它给人以"已经测过了"的错觉）。
+        //
+        // 所以改成**结构性断言**：直接问这个字段到底是不是并发安全的容器。
+        // 这不依赖时序，改动实现必然变红。
+        java.lang.reflect.Field f = NetworkView.class.getDeclaredField("latest");
+        f.setAccessible(true);
+        NetworkView view = new NetworkView();
+        Object map = f.get(view);
+
+        String cls = map.getClass().getName();
+        boolean safeWrapper = cls.contains("SynchronizedMap")
+            || cls.contains("ConcurrentHashMap");
+        assertTrue(safeWrapper,
+            "NetworkView.latest 必须是并发安全的容器（当前是 " + cls + "）。"
+                + "写入来自 Netty 的多个 event-loop 线程，读取来自命令线程，"
+                + "裸 Map 会抛 ConcurrentModificationException 并在扩容时丢条目。"
+                + "注意：普通的 HashMap/LinkedHashMap 即使加了 synchronized 块也不够——"
+                + "snapshot() 里对副本的遍历同样需要与写入互斥。");
+    }
+
+    @Test
+    @DisplayName("并发读写不抛异常（辅助验证，不作为唯一防线）")
+    void survivesConcurrentReadWrite() throws Exception {
+        // 这一条是补充，不是主防线（主防线见上一条的结构断言）。
+        // 它验的是"在真实并发下不会崩"，但压测撞不出 CME 不代表没有问题，
+        // 所以不能只靠它。
+        NetworkView view = new NetworkView();
+        java.util.concurrent.atomic.AtomicReference<Throwable> boom =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+        for (int round = 0; round < 3 && boom.get() == null; round++) {
+            view.clear();
+            java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+            List<Thread> threads = new java.util.ArrayList<>();
+            final int r = round;
+
+            for (int w = 0; w < 6; w++) {
+                final int id = w;
+                Thread t = new Thread(() -> {
+                    try {
+                        start.await();
+                        for (int i = 0; i < 300; i++) {
+                            view.onPacket(okPacket("r" + r + "-w" + id + "-i" + i, 1_000L, 20.0, 1));
+                        }
+                    } catch (Throwable e) {
+                        boom.compareAndSet(null, e);
+                    }
+                });
+                threads.add(t);
+                t.start();
+            }
+            for (int rd = 0; rd < 4; rd++) {
+                Thread t = new Thread(() -> {
+                    try {
+                        start.await();
+                        for (int i = 0; i < 3000; i++) {
+                            view.snapshot(2_000L + i, 10, List.of());
+                        }
+                    } catch (Throwable e) {
+                        boom.compareAndSet(null, e);
+                    }
+                });
+                threads.add(t);
+                t.start();
+            }
+
+            start.countDown();
+            for (Thread t : threads) t.join(60_000);
+        }
+
+        if (boom.get() != null) {
+            throw new AssertionError("并发读写抛异常了（说明容器/锁没做对）：", boom.get());
+        }
+    }
+
+    @Test
+    @DisplayName("clear() 真的能清空（它是 reset 子命令的实现）")
+    void clearActuallyClears() {
+        NetworkView view = new NetworkView();
+        view.onPacket(okPacket("a", 1_000L, 20.0, 1));
+        assertEquals(1, view.trackedCount());
+        view.clear();
+        assertEquals(0, view.trackedCount(), "clear() 必须真的清空，否则 reset 子命令是假的");
+    }
 }

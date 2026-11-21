@@ -41,6 +41,20 @@ public final class SummaryPacket {
     /** 计数型字段的"没采到"，与主仓 COUNT_UNAVAILABLE 一致。 */
     public static final int COUNT_UNAVAILABLE = -1;
 
+    /**
+     * serverId 的最大长度。
+     *
+     * <p>这个字段**完全来自网络输入**，而且会被原样打印到游戏内面板上。
+     * 不设上限时有两个后果：一台恶意后端可以用超长 id 把代理的堆填满
+     * （实测约 500 个 2MB 的 id 就能吃满 1G 堆），以及把一条 2MB 的聊天消息
+     * 塞进管理员的客户端。64 对真实用途绰绰有余（`survival`、`skyblock-a`、
+     * `minigames-3` 这种），超出的直接判为无效包。</p>
+     */
+    public static final int MAX_SERVER_ID_LENGTH = 64;
+
+    /** 合理的玩家数上限（防止伪造包把聚合值撑到荒谬的量级）。 */
+    private static final int MAX_PLAYERS = 100_000;
+
     private final String serverId;
     private final long sentAtMs;
     private final long collectedAtMs;
@@ -60,7 +74,14 @@ public final class SummaryPacket {
         this.tps5m = getDoubleOrNull(o, "tps5m");
         this.tps15m = getDoubleOrNull(o, "tps15m");
         this.msptAvg = getDoubleOrNull(o, "msptAvg");
-        this.playerCount = (int) getLong(o, "players", COUNT_UNAVAILABLE);
+        long rawPlayers = getLong(o, "players", COUNT_UNAVAILABLE);
+        // 范围校验：-1 是"没采到"的合法哨兵；其余必须落在 [0, MAX_PLAYERS]。
+        // 越界值（-99999 或 long→int 截断后的荒谬数字）一律当作"没采到"，
+        // 而不是原样显示到面板上。
+        this.playerCount = (rawPlayers == COUNT_UNAVAILABLE
+            || rawPlayers < 0 || rawPlayers > MAX_PLAYERS)
+            ? COUNT_UNAVAILABLE
+            : (int) rawPlayers;
     }
 
     // ---- 访问器 ----
@@ -111,6 +132,12 @@ public final class SummaryPacket {
             // 只处理自己认识的 kind。同一通道将来可能承载别的东西（比如代理→后端的查询）。
             String kind = getString(o, "kind", "");
             if (!"summary".equals(kind)) {
+                return null;
+            }
+
+            // serverId 长度闸门：留着超长 id 会撑爆堆，也会把面板撑成几 MB 的聊天行。
+            String server = getString(o, "server", "");
+            if (server.length() > MAX_SERVER_ID_LENGTH) {
                 return null;
             }
 

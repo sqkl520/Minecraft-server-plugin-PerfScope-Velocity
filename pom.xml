@@ -12,7 +12,7 @@
       两个 artifact 的版本必须同步：协议版本（NetworkSummary.PROTOCOL_VERSION）决定能不能通信，
       artifact 版本只决定"这是哪一版代码"。它们的对应关系写在 CHANGELOG 里，不靠文件名猜。
     -->
-    <version>1.4.5-SNAPSHOT-fix2</version>
+    <version>1.4.5-SNAPSHOT-fix3</version>
     <packaging>jar</packaging>
 
     <name>PerfScope-Velocity</name>

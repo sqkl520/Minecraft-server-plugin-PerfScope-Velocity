@@ -28,6 +28,24 @@ Paper 后端 × N                        Velocity 代理
 「无数据」，**不能**显示成「正常」或「TPS 0」。把这三件事混成一个「-」，是仪表盘最常见的谎言——
 服主看到「-」会以为没问题，看到「0」会以为服务器挂了，而真相往往只是没人玩所以没有转发通道。
 
+## 权限
+
+命令 `/pscope network`（别名 `/perfscope network`、`/ps network`），权限节点 `perfscope.network`。
+
+**默认谁都看不到，包括玩家。** Velocity 没有 `plugin.yml` 那种权限声明，插件无法给节点设默认值；
+没装权限插件时 Velocity 的 `permissionFunction` 是 `ALWAYS_UNDEFINED`，`hasPermission` 返回 `false`。
+这是保守的正确默认，但你需要知道它——**装完发现玩家用不了，通常就是这个原因**。
+
+授权步骤：装一个权限插件（LuckPerms 等）→ 给玩家或组加 `perfscope.network`。
+
+**失败形态容易误判**：没权限时 Velocity 会把命令**转发到后端**执行，玩家看到的是
+**后端 PerfScope 的帮助页**，不是"你没有权限"。看到帮助页而命令没反应时，先查权限。
+
+**授权前请确认面板会展示什么**：所有后端名（含从未上报的）、各自 TPS / MSPT / 在线人数、
+全网在线合计。如果后端名里带了内网主机名之类信息，它会原样出现在这个玩家的聊天窗口里。
+
+**控制台始终可用**（按类型白名单放行，不是"任何非玩家都放行"）。
+
 ## 四种状态
 
 面板上每一行必定是这四种之一，且它们的含义完全不同：
@@ -53,8 +71,14 @@ network:
   push-interval-seconds: 10
 ```
 
-还要保证代理的转发模式是 `traditional` / `legacy`。**Velocity 的 `modern` 转发模式下
-plugin messaging 不可用**，这是「配了但代理收不到」最常见的原因。
+还要保证各后端装了 PerfScope 并在它们的 `config.yml` 里开了 `network.enabled`。
+
+**关于代理的转发模式**：`modern` 与 `traditional` / `legacy` **都能用**。
+此前本文档写过"modern 下 plugin messaging 不可用"，那是**错的**——modern 转发本身就是靠
+`velocity:player_info` 这条 plugin message 完成握手的；后端→代理的 plugin message 路径
+（`BackendPlaySessionHandler`）里没有任何转发模式分支，唯一的门控是"这个通道有没有被注册"。
+真正在 modern 下不可用的是 BungeeCord 那条 legacy 专用通道，与本插件无关。
+**不要为了这个问题把代理降级成 legacy**——那会引入比它更糟的信任模型。
 
 ## 两个仓库的关系
 
@@ -65,7 +89,8 @@ plugin messaging 不可用**，这是「配了但代理收不到」最常见的�
 
 **版本必须共存**：`SummaryPacket.PROTOCOL_VERSION` 决定能不能通信，两侧必须一致。
 artifact 版本（`1.4.5-SNAPSHOT-fix1` 这种）只决定"这是哪一版代码"，两者不要混。
-协议版本不一致时，高版本发的包会被低版本**直接丢弃并记日志**，而不是"尽力解析"——
+协议版本不一致时，高版本发的包会被低版本**直接丢弃并记日志**（每分钟最多一条，附带丢弃条数，
+避免被刷屏），而不是"尽力解析"——
 后者会把新字段读成缺失，正是本项目反复修的那类静默失真。
 
 ## 构建

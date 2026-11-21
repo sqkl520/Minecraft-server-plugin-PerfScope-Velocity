@@ -68,12 +68,15 @@ public final class PerfScopeVelocity {
         server.getChannelRegistrar().register(CHANNEL);
 
         // 注册命令。Velocity 的命令必须显式注册，没有 plugin.yml 那种声明式入口。
-        server.getCommandManager().metaBuilder("pscope")
-            .aliases("perfscope", "ps")
-            .plugin(this)
-            .build();
+        //
+        // 只构造一次 meta。此前写了两次 metaBuilder 链，第一次的 .plugin(this) 挂在
+        // 一个被丢弃的对象上（纯死代码），真正注册的那份反过来没有 .plugin(this)，
+        // 于是命令归到一个匿名虚拟插件、执行器线程名也是别人的——排错时会误导。
         server.getCommandManager().register(
-            server.getCommandManager().metaBuilder("pscope").aliases("perfscope", "ps").build(),
+            server.getCommandManager().metaBuilder("pscope")
+                .aliases("perfscope", "ps")
+                .plugin(this)
+                .build(),
             new NetworkCommand(this));
 
         logger.info("PerfScope (Velocity) 已启用，监听通道 {}/{}",
@@ -110,18 +113,57 @@ public final class PerfScopeVelocity {
 
         SummaryPacket packet = SummaryPacket.parse(event.getData());
         if (packet == null) {
-            // 版本不兼容 / 字段缺失 / 格式错误。静默丢弃：这是网络输入，
-            // 不值得为一个坏包刷日志，但代理必须活着。
+            // 版本不兼容 / 字段缺失 / 格式错误。
+            //
+            // 文档里承诺过"会记日志"，所以这里必须真的记——但网络输入不能刷屏：
+            // 一台配错版本的后端每秒都在发，逐条记会把磁盘写满。
+            // 因此按固定窗口内只记一条，并带上丢弃计数。
+            noteDropped();
             return;
         }
         if (packet.serverId() == null || packet.serverId().isBlank()
             || "unknown".equals(packet.serverId())) {
             // 没有身份就无法归位——两个都叫 unknown 的后端会互相覆盖。
-            logger.warn("收到一条没有 server-id 的跨服摘要，已丢弃。"
-                + "请在该后端配置 network.server-id（多后端必须各不相同）。");
+            // 同样限频：恶意后端可以每包都发空 id。
+            noteBadId();
             return;
         }
         view.onPacket(packet);
+    }
+
+    /** 丢弃包的限频日志窗口。 */
+    private static final long DROP_LOG_INTERVAL_MS = 60_000L;
+    private long lastDropLogAtMs;
+    private int droppedSinceLog;
+
+    /** 记录一次"包不能用"并限频输出。 */
+    private void noteDropped() {
+        droppedSinceLog++;
+        long now = System.currentTimeMillis();
+        if (now - lastDropLogAtMs >= DROP_LOG_INTERVAL_MS) {
+            logger.warn("丢弃了 {} 条无法解析的跨服摘要（近 {} 秒）。常见原因是两侧协议版本不一致："
+                    + "后端协议版本 {}，代理侧为 {}。请确认两边插件都是最新版本。",
+                droppedSinceLog, (now - lastDropLogAtMs) / 1000L,
+                SummaryPacket.PROTOCOL_VERSION, SummaryPacket.PROTOCOL_VERSION);
+            lastDropLogAtMs = now;
+            droppedSinceLog = 0;
+        }
+    }
+
+    private long lastBadIdLogAtMs;
+    private int badIdSinceLog;
+
+    /** 记录一次"没有 server-id"并限频输出。 */
+    private void noteBadId() {
+        badIdSinceLog++;
+        long now = System.currentTimeMillis();
+        if (now - lastBadIdLogAtMs >= DROP_LOG_INTERVAL_MS) {
+            logger.warn("丢弃了 {} 条没有 server-id 的跨服摘要（近 {} 秒）。"
+                    + "请在各后端 config.yml 的 network.server-id 配置一个不同的值。",
+                badIdSinceLog, (now - lastBadIdLogAtMs) / 1000L);
+            lastBadIdLogAtMs = now;
+            badIdSinceLog = 0;
+        }
     }
 
     // ---- 给命令层用的访问器 ----

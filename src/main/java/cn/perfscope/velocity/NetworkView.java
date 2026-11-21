@@ -78,10 +78,28 @@ public final class NetworkView {
         }
     }
 
-    private final Map<String, SummaryPacket> latest = new LinkedHashMap<>();
+    /** 最多跟踪多少个后端。超出时淘汰最久没更新的那个。 */
+    public static final int MAX_TRACKED_SERVERS = 256;
+
+    /**
+     * 已收到的最近一包，key 是 serverId。
+     *
+     * <p><b>必须是并发容器</b>：写入来自 Netty 的 event-loop 线程（每条后端连接可能在
+     * 不同的 loop 上），读取来自命令执行线程。裸 {@code LinkedHashMap} 在这种用法下会
+     * 抛 {@code ConcurrentModificationException}（管理员执行命令直接失败），
+     * 并在并发扩容时丢条目或产生重复 key——后者会让面板显示的数字与实际不符，
+     * 是这里最不该出现的一种错。</p>
+     */
+    private final Map<String, SummaryPacket> latest =
+        java.util.Collections.synchronizedMap(new LinkedHashMap<>());
 
     /**
      * 收到一条摘要。同一个 serverId 后来者覆盖前者（只保留最近一次）。
+     *
+     * <p>条目数上限 {@link #MAX_TRACKED_SERVERS}：serverId 完全来自网络输入，
+     * 不设上限时一台恶意/被入侵的后端可以用不断变化的 id 把堆填满
+     * （实测约 500 个 2MB 的 id 就能吃满 1G 堆）。超限时淘汰**最久没更新**的那条，
+     * 而不是拒绝新的：拒绝新 id 会让一台刚重启的后端永远显示不出来。</p>
      *
      * @param packet 解析成功的包；{@code null} 会被忽略
      */
@@ -89,12 +107,31 @@ public final class NetworkView {
         if (packet == null) {
             return;
         }
-        latest.put(packet.serverId(), packet);
+        synchronized (latest) {
+            if (!latest.containsKey(packet.serverId()) && latest.size() >= MAX_TRACKED_SERVERS) {
+                // LinkedHashMap 的插入序即"第一次出现的顺序"；淘汰头部最久未见的。
+                java.util.Iterator<String> it = latest.keySet().iterator();
+                if (it.hasNext()) {
+                    it.next();
+                    it.remove();
+                }
+            }
+            // 重新插入以刷新插入序，让淘汰顺序真正反映"最近是否活跃"。
+            latest.remove(packet.serverId());
+            latest.put(packet.serverId(), packet);
+        }
     }
 
-    /** 已知的后端 id 集合（收到过包的）。 */
+    /** 已知的后端 id 集合（收到过包的）。返回快照副本，避免调用方与写入线程竞争。 */
     public java.util.Set<String> knownServers() {
-        return java.util.Collections.unmodifiableSet(latest.keySet());
+        synchronized (latest) {
+            return java.util.Collections.unmodifiableSet(new java.util.LinkedHashSet<>(latest.keySet()));
+        }
+    }
+
+    /** 当前跟踪的后端条数（给配置/诊断用）。 */
+    public int trackedCount() {
+        return latest.size();
     }
 
     /**
@@ -107,6 +144,13 @@ public final class NetworkView {
      * @return 按 id 排序的节点列表
      */
     public List<Node> snapshot(long nowMs, int pushIntervalSec, java.util.Collection<String> expectedServers) {
+        // 先把 latest 的副本拿出来，之后的计算全在副本上做。
+        // 这样即使写入线程此刻正在 put，也不会让下面的迭代抛 ConcurrentModificationException。
+        java.util.Map<String, SummaryPacket> copy;
+        synchronized (latest) {
+            copy = new LinkedHashMap<>(latest);
+        }
+
         // 先收集要展示的全部 id：收到过包的 ∪ 配置里声明的。
         // 并集很重要——只看收到过包的话，一台从没上报过的后端会彻底隐身，
         // 而"少了哪一台"正是这个视图最该回答的问题。
@@ -114,13 +158,13 @@ public final class NetworkView {
         if (expectedServers != null) {
             ids.addAll(expectedServers);
         }
-        ids.addAll(latest.keySet());
+        ids.addAll(copy.keySet());
 
         long staleAfterMs = Math.max(1, pushIntervalSec) * 1000L * STALE_MULTIPLIER;
 
         List<Node> out = new ArrayList<>();
         for (String id : ids) {
-            SummaryPacket p = latest.get(id);
+            SummaryPacket p = copy.get(id);
             if (p == null) {
                 out.add(new Node(id, State.NO_DATA, null, Long.MAX_VALUE));
                 continue;
@@ -194,8 +238,10 @@ public final class NetworkView {
         return n;
     }
 
-    /** 清空（reload 时用）。 */
+    /** 清空。给"重新开始统计"用；调用点见 {@code NetworkCommand} 的 {@code reset} 子命令。 */
     public void clear() {
-        latest.clear();
+        synchronized (latest) {
+            latest.clear();
+        }
     }
 }
