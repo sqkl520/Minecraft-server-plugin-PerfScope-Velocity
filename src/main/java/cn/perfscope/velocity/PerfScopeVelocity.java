@@ -117,8 +117,8 @@ public final class PerfScopeVelocity {
             //
             // 文档里承诺过"会记日志"，所以这里必须真的记——但网络输入不能刷屏：
             // 一台配错版本的后端每秒都在发，逐条记会把磁盘写满。
-            // 因此按固定窗口内只记一条，并带上丢弃计数。
-            noteDropped();
+            // 因此按固定窗口内只记一条，并带上丢弃计数与**对方声明的版本**。
+            noteDropped(SummaryPacket.peekVersion(event.getData()));
             return;
         }
         if (packet.serverId() == null || packet.serverId().isBlank()
@@ -133,34 +133,52 @@ public final class PerfScopeVelocity {
 
     /** 丢弃包的限频日志窗口。 */
     private static final long DROP_LOG_INTERVAL_MS = 60_000L;
+    /** 0 = 还没记过（首次丢弃时的窗口长度按 0 秒算，不能拿 epoch 当起点）。 */
     private long lastDropLogAtMs;
     private int droppedSinceLog;
+    /** 窗口内最近一次能读到的对方协议版本；-1 = 读不出来（不是 JSON / 没 v 字段）。 */
+    private int lastSeenVersion = -1;
 
-    /** 记录一次"包不能用"并限频输出。 */
-    private void noteDropped() {
+    /**
+     * 记录一次"包不能用"并限频输出。
+     *
+     * <p>方法本身加锁：丢弃来自多个 Netty event-loop，不加锁时计数会丢增量，
+     * 而"丢了多少条"正是判断问题规模唯一的数据。日志窗口本身已经把开销压到一分钟一次，
+     * 同步的代价可以忽略。</p>
+     *
+     * @param peerVersion 对方包里声明的协议版本；{@code null} = 读不出来
+     */
+    private synchronized void noteDropped(Integer peerVersion) {
         droppedSinceLog++;
+        if (peerVersion != null) {
+            lastSeenVersion = peerVersion;
+        }
         long now = System.currentTimeMillis();
-        if (now - lastDropLogAtMs >= DROP_LOG_INTERVAL_MS) {
-            logger.warn("丢弃了 {} 条无法解析的跨服摘要（近 {} 秒）。常见原因是两侧协议版本不一致："
-                    + "后端协议版本 {}，代理侧为 {}。请确认两边插件都是最新版本。",
-                droppedSinceLog, (now - lastDropLogAtMs) / 1000L,
-                SummaryPacket.PROTOCOL_VERSION, SummaryPacket.PROTOCOL_VERSION);
+        if (lastDropLogAtMs == 0L || now - lastDropLogAtMs >= DROP_LOG_INTERVAL_MS) {
+            String peer = lastSeenVersion < 0 ? "无法识别" : String.valueOf(lastSeenVersion);
+            // 首次没有"上一个窗口"可算，写 0 秒而不是拿 epoch 当起点（那会打出十几亿秒）。
+            long windowSec = lastDropLogAtMs == 0L ? 0L : (now - lastDropLogAtMs) / 1000L;
+            logger.warn("丢弃了 {} 条无法解析的跨服摘要（近 {} 秒）。对方协议版本 {}，本端 {}。"
+                    + "若两边版本不一致，请把较旧的一侧升级到最新。",
+                droppedSinceLog, windowSec, peer, SummaryPacket.PROTOCOL_VERSION);
             lastDropLogAtMs = now;
             droppedSinceLog = 0;
+            lastSeenVersion = -1;
         }
     }
 
     private long lastBadIdLogAtMs;
     private int badIdSinceLog;
 
-    /** 记录一次"没有 server-id"并限频输出。 */
-    private void noteBadId() {
+    /** 记录一次"没有 server-id"并限频输出。加锁理由同 {@link #noteDropped}。 */
+    private synchronized void noteBadId() {
         badIdSinceLog++;
         long now = System.currentTimeMillis();
-        if (now - lastBadIdLogAtMs >= DROP_LOG_INTERVAL_MS) {
+        if (lastBadIdLogAtMs == 0L || now - lastBadIdLogAtMs >= DROP_LOG_INTERVAL_MS) {
+            long windowSec = lastBadIdLogAtMs == 0L ? 0L : (now - lastBadIdLogAtMs) / 1000L;
             logger.warn("丢弃了 {} 条没有 server-id 的跨服摘要（近 {} 秒）。"
                     + "请在各后端 config.yml 的 network.server-id 配置一个不同的值。",
-                badIdSinceLog, (now - lastBadIdLogAtMs) / 1000L);
+                badIdSinceLog, windowSec);
             lastBadIdLogAtMs = now;
             badIdSinceLog = 0;
         }

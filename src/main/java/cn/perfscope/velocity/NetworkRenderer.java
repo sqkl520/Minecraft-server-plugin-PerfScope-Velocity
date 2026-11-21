@@ -56,10 +56,23 @@ public final class NetworkRenderer {
     /** 表头。 */
     public static final String[] HEADERS = {"后端", "状态", "TPS(1m)", "MSPT", "玩家", "数据年龄"};
 
-    /** 阈值：低于这个 TPS 算警告。与主仓 README 的早预警语义同口径（闭区间）。 */
+    /**
+     * TPS 阈值，与后端 {@code config.yml} 的随包默认值同口径。
+     *
+     * <p><b>为什么必须同口径</b>：同一台后端在两个面板上被染成不同颜色是最伤信任的一种
+     * 不一致——服主会先怀疑某一个插件坏了。此前这里写 18/15 用开区间，而后端
+     * {@code ThresholdColors} 用闭区间（{@code value <= threshold}），于是恰好 15.00 与
+     * 18.00 两个点两边着色相反。后端那几个值可配置，代理侧读不到，所以这里对齐的是
+     * **随包默认值**；改了后端阈值就该同步改这里（README 有写明）。</p>
+     */
     public static final double TPS_WARN = 18.0;
-    /** 阈值：低于这个 TPS 算严重。 */
+    /** 低于等于这个 TPS 算严重。 */
     public static final double TPS_CRITICAL = 15.0;
+
+    /** MSPT 阈值，与后端默认值一致（45 警告 / 50 严重）。 */
+    public static final double MSPT_WARN = 45.0;
+    /** 高于等于这个 MSPT 算严重。 */
+    public static final double MSPT_CRITICAL = 50.0;
 
     private NetworkRenderer() {
     }
@@ -132,9 +145,9 @@ public final class NetworkRenderer {
             return cell("—", Level.UNKNOWN);
         }
         Level level;
-        if (tps < TPS_CRITICAL) {
+        if (tps <= TPS_CRITICAL) {
             level = Level.CRITICAL;
-        } else if (tps < TPS_WARN) {
+        } else if (tps <= TPS_WARN) {
             level = Level.WARN;
         } else {
             level = Level.OK;
@@ -142,15 +155,15 @@ public final class NetworkRenderer {
         return cell(String.format(Locale.ROOT, "%.2f", tps), level);
     }
 
-    /** MSPT 格：缺失写"—"。越高越糟。 */
+    /** MSPT 格：缺失写"—"。越高越糟，闭区间（与后端 {@code ThresholdColors} 一致）。 */
     static Cell msptCell(Double mspt) {
         if (mspt == null) {
             return cell("—", Level.UNKNOWN);
         }
         Level level;
-        if (mspt > 45.0) {
+        if (mspt >= MSPT_CRITICAL) {
             level = Level.CRITICAL;
-        } else if (mspt > 35.0) {
+        } else if (mspt >= MSPT_WARN) {
             level = Level.WARN;
         } else {
             level = Level.OK;
@@ -213,6 +226,55 @@ public final class NetworkRenderer {
     }
 
     // ---- 构造辅助 ----
+
+    /**
+     * 一格的显示宽度，按"半角 1 / 全角 2"估算。
+     *
+     * <p><b>为什么需要它</b>：面板靠空格分隔，而中文与数字的宽度不同——「数据过期」四字与
+     * 「正常」两字差一倍，`6` 与 `57` 又差一格。不做填充时每一行的第 3 列起都在不同的横坐标上，
+     * 六行以上完全无法纵向比较，而"横向比较哪台不对劲"正是这个面板存在的理由。</p>
+     *
+     * <p><b>为什么不追求像素级对齐</b>：Minecraft 默认字体里 ASCII 是变宽的（`i` 与 `W` 差三倍），
+     * 真正的像素对齐需要一张逐字符宽度表，而那张表会随资源包变化。这里按"ASCII 占 1 格、
+     * 其余（中文、全角标点、破折号）占 2 格"估算，代价是等宽字体下会有半格以内的偏差，
+     * 收益是列起点稳定下来。刻意不引入字体表：代价远大于收益。</p>
+     */
+    static int displayWidth(String s) {
+        if (s == null) return 0;
+        int w = 0;
+        for (int i = 0; i < s.length(); ) {
+            int cp = s.codePointAt(i);
+            i += Character.charCount(cp);
+            // 非 ASCII 一律按 2 格算：中文、全角标点，以及 — / ｜ 这类符号在默认字体里
+            // 都走 unifont 的 9px 字形，实际占位接近两个半角字符。
+            w += cp < 0x80 ? 1 : 2;
+        }
+        return w;
+    }
+
+    /** 把一格里补到指定显示宽度（不足补半角空格）。 */
+    static String padTo(String s, int width) {
+        int pad = width - displayWidth(s);
+        if (pad <= 0) return s;
+        StringBuilder sb = new StringBuilder(s);
+        for (int i = 0; i < pad; i++) sb.append(' ');
+        return sb.toString();
+    }
+
+    /** 一组行（含表头）每列的最大显示宽度，供命令层按列填充。 */
+    static int[] columnWidths(List<Row> rows, String[] headers) {
+        int[] w = new int[headers.length];
+        for (int i = 0; i < headers.length; i++) {
+            w[i] = displayWidth(headers[i]);
+        }
+        for (Row row : rows) {
+            List<Cell> cells = row.cells();
+            for (int i = 0; i < cells.size() && i < w.length; i++) {
+                w[i] = Math.max(w[i], displayWidth(cells.get(i).text()));
+            }
+        }
+        return w;
+    }
 
     private static Cell cell(String text, Level level) {
         return new Cell(text, level);

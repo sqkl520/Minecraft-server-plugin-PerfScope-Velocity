@@ -138,7 +138,7 @@ public final class NetworkView {
      * 计算当前视图。
      *
      * @param nowMs            当前时间
-     * @param pushIntervalSec  配置的上报间隔（秒），用于算 STALE 阈值
+     * @param pushIntervalSec  默认上报间隔（秒）；包自带间隔时以包为准
      * @param expectedServers  配置里列出的后端 id；这些即使没收到包也要出现在视图里
      *                         （显示为 {@link State#NO_DATA}），否则"少了一台"这件事看不出来
      * @return 按 id 排序的节点列表
@@ -160,7 +160,7 @@ public final class NetworkView {
         }
         ids.addAll(copy.keySet());
 
-        long staleAfterMs = Math.max(1, pushIntervalSec) * 1000L * STALE_MULTIPLIER;
+        long fallbackStaleMs = Math.max(1, pushIntervalSec) * 1000L * STALE_MULTIPLIER;
 
         List<Node> out = new ArrayList<>();
         for (String id : ids) {
@@ -170,12 +170,17 @@ public final class NetworkView {
                 continue;
             }
             long age = p.ageMs(nowMs);
+            // 过期阈值按这台后端**自己**的间隔算（包里有就用包的，没有才回退默认）。
+            // 否则服主把间隔调大到 60 秒后，每两轮上报之间都会被误判成"数据过期"。
+            long staleMs = p.pushIntervalSec() > 0
+                ? p.pushIntervalSec() * 1000L * STALE_MULTIPLIER
+                : fallbackStaleMs;
             // COLLECTOR_DEAD 优先于 STALE：包还在到，说明链路是通的，
             // 问题出在后端采集器而不是网络。这个区分决定了该去查哪一头。
             State s;
             if (!p.collectorAlive()) {
                 s = State.COLLECTOR_DEAD;
-            } else if (age > staleAfterMs) {
+            } else if (age > staleMs) {
                 s = State.STALE;
             } else {
                 s = State.OK;

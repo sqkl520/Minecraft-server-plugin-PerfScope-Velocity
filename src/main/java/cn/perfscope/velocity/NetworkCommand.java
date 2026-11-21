@@ -50,27 +50,47 @@ public final class NetworkCommand implements SimpleCommand {
         long now = System.currentTimeMillis();
         List<NetworkView.Node> nodes = plugin.view().snapshot(now, DEFAULT_PUSH_INTERVAL_SEC, expectedServers());
 
-        if (nodes.isEmpty()) {
-            src.sendMessage(Component.text(
-                "还没有任何后端上报数据。请确认："
-                    + "(1) 各后端 config.yml 的 network.enabled 为 true；"
-                    + "(2) 代理转发模式为 traditional/legacy（modern 模式下 plugin messaging 不可用）；"
-                    + "(3) 该后端有玩家在线（空服没有转发通道）。",
-                NamedTextColor.YELLOW));
-            return;
-        }
-
         Double avgTps = NetworkView.averageTps1m(nodes);
         Integer totalPlayers = NetworkView.totalPlayers(nodes);
 
         src.sendMessage(Component.text(
             NetworkRenderer.summaryLine(nodes, avgTps, totalPlayers), NamedTextColor.GRAY));
-        src.sendMessage(Component.text(
-            String.join("  ", NetworkRenderer.HEADERS), NamedTextColor.WHITE));
+
+        // 排查提示挂在「没有一个后端正常」上，而不是「一行都没有」上。
+        //
+        // 后者在真实代理上几乎不可达：velocity.toml 里只要配了后端，expectedServers()
+        // 就非空，视图里必然有行（显示成「无数据」）。于是首装失败时服主只看到满屏
+        // 深灰的「无数据」，而那段写得最用心的三步排查提示一次也显示不出来——
+        // 恰恰是最需要它的时候。
+        if (NetworkView.count(nodes, NetworkView.State.OK) == 0) {
+            src.sendMessage(Component.text(
+                "没有任何后端处于「正常」状态。请确认："
+                    + "(1) 各后端 config.yml 的 network.enabled 为 true；"
+                    + "(2) 该后端有玩家在线（空服没有转发通道）；"
+                    + "(3) 代理已装本插件、且未把本通道转发走。"
+                    + "空服后端显示「无数据」是预期行为，不是故障。",
+                NamedTextColor.YELLOW));
+        }
+        if (nodes.isEmpty()) {
+            return;
+        }
 
         List<NetworkRenderer.Row> rows = NetworkRenderer.render(nodes);
+        // 按各列最大宽度填充后再拼：否则中文状态（4 字）与数字（1-2 格）会让每一行的
+        // 第 3 列起落在不同位置，六行以上看不出哪台不对劲——而横向比较正是这个
+        // 面板存在的理由。填充在命令层做，因为只有这里知道要拼成一行。
+        int[] widths = NetworkRenderer.columnWidths(rows, NetworkRenderer.HEADERS);
+        StringBuilder header = new StringBuilder();
+        for (int i = 0; i < NetworkRenderer.HEADERS.length; i++) {
+            if (i > 0) header.append("  ");
+            String h = NetworkRenderer.HEADERS[i];
+            header.append(i == NetworkRenderer.HEADERS.length - 1
+                ? h : NetworkRenderer.padTo(h, widths[i]));
+        }
+        src.sendMessage(Component.text(header.toString(), NamedTextColor.WHITE));
+
         for (NetworkRenderer.Row row : rows) {
-            src.sendMessage(renderRow(row));
+            src.sendMessage(renderRow(row, widths));
         }
     }
 
@@ -96,16 +116,20 @@ public final class NetworkCommand implements SimpleCommand {
         }
     }
 
-    /** 把一行的各格拼成一个 Component，逐格上色。 */
-    private static Component renderRow(NetworkRenderer.Row row) {
+    /** 把一行的各格拼成一个 Component，逐格上色，按 {@code widths} 补齐列宽。 */
+    private static Component renderRow(NetworkRenderer.Row row, int[] widths) {
         Component out = Component.empty();
-        boolean first = true;
-        for (NetworkRenderer.Cell cell : row.cells()) {
-            if (!first) {
+        List<NetworkRenderer.Cell> cells = row.cells();
+        for (int i = 0; i < cells.size(); i++) {
+            NetworkRenderer.Cell cell = cells.get(i);
+            if (i > 0) {
                 out = out.append(Component.text("  ", NamedTextColor.DARK_GRAY));
             }
-            first = false;
-            out = out.append(Component.text(cell.text(), colorOf(cell.level())));
+            // 最后一列不补：行尾空格在聊天框里看不见，只是白白多几个字符。
+            String text = i == cells.size() - 1
+                ? cell.text()
+                : NetworkRenderer.padTo(cell.text(), widths[i]);
+            out = out.append(Component.text(text, colorOf(cell.level())));
         }
         return out;
     }

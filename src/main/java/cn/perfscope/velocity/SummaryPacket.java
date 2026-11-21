@@ -31,9 +31,14 @@ import java.util.Map;
  */
 public final class SummaryPacket {
 
-    /** 与主仓 NetworkSummary.PROTOCOL_VERSION 必须一致。 */
+    /**
+     * 与主仓 NetworkSummary.PROTOCOL_VERSION 必须一致。
+     *
+     * <p>升号的含义是"旧接收方会拒收"：本端拒绝 {@code v} 比自己高的包。所以新增**可选**
+     * 字段不升号（缺字段本来就要容忍，多一个不认识的键也不影响按 key 取值）；
+     * 只有删字段、改语义、改单位才升。</p>
+     */
     public static final int PROTOCOL_VERSION = 1;
-
     /** 通道名，与主仓 NetworkSummary.CHANNEL 逐字一致。 */
     public static final String CHANNEL_NAMESPACE = "perfscope";
     public static final String CHANNEL_NAME = "summary";
@@ -64,6 +69,7 @@ public final class SummaryPacket {
     private final Double tps15m;
     private final Double msptAvg;
     private final int playerCount;
+    private final int pushIntervalSec;
 
     private SummaryPacket(JsonObject o) {
         this.serverId = getString(o, "server", "unknown");
@@ -74,6 +80,11 @@ public final class SummaryPacket {
         this.tps5m = getDoubleOrNull(o, "tps5m");
         this.tps15m = getDoubleOrNull(o, "tps15m");
         this.msptAvg = getDoubleOrNull(o, "msptAvg");
+        // 上报间隔由后端随包带来（0 = 旧版后端没提供）。范围校验与后端
+        // ConfigManager 的 1–300 一致——越界值不能拿来算过期阈值，否则一个
+        // 伪造的极大值会让该后端永远显示"正常"。
+        long rawInterval = getLong(o, "pushIntervalSec", 0L);
+        this.pushIntervalSec = (rawInterval >= 1 && rawInterval <= 300) ? (int) rawInterval : 0;
         long rawPlayers = getLong(o, "players", COUNT_UNAVAILABLE);
         // 范围校验：-1 是"没采到"的合法哨兵；其余必须落在 [0, MAX_PLAYERS]。
         // 越界值（-99999 或 long→int 截断后的荒谬数字）一律当作"没采到"，
@@ -99,12 +110,51 @@ public final class SummaryPacket {
     /** {@link #COUNT_UNAVAILABLE} = 没采到；{@code 0} 是合法的空服读数。 */
     public int playerCount() { return playerCount; }
 
+    /**
+     * 后端自己的上报间隔（秒）。
+     *
+     * <p>{@code 0} = 这条包没带这个字段（旧版后端），调用方应回退到默认假设。
+     * 非 0 时它是**权威值**：过期判定必须按它算，而不是按写死的 10 秒——否则
+     * 服主把间隔调到 60 秒后，面板会有一半时间显示"数据过期"。</p>
+     */
+    public int pushIntervalSec() { return pushIntervalSec; }
+
     /** 快照年龄（毫秒）。负值按 0 处理——时钟不同步不该读成"未来的数据"。 */
     public long ageMs(long nowMs) {
         return collectedAtMs <= 0L ? Long.MAX_VALUE : Math.max(0L, nowMs - collectedAtMs);
     }
 
     // ---- 解析入口 ----
+
+    /**
+     * 只读出包里的协议版本，不做任何校验。
+     *
+     * <p>用途只有一个：{@link #parse} 失败时把"对方发的到底是哪一版"写进告警日志。
+     * 不写这一句的话，日志只能报本端版本，服主看不出该升哪一边——而"只升了一侧"
+     * 恰恰是这类丢弃最常见的原因。</p>
+     *
+     * @param payload 原始字节；读不出来返回 {@code null}
+     */
+    public static Integer peekVersion(byte[] payload) {
+        if (payload == null || payload.length == 0) {
+            return null;
+        }
+        try {
+            JsonElement root = JsonParser.parseString(
+                new String(payload, java.nio.charset.StandardCharsets.UTF_8));
+            if (!root.isJsonObject()) {
+                return null;
+            }
+            JsonElement v = root.getAsJsonObject().get("v");
+            if (v == null || v.isJsonNull() || !v.isJsonPrimitive()) {
+                return null;
+            }
+            return v.getAsInt();
+        } catch (Exception e) {
+            // 连 JSON 都不是：没有版本可读，这本身就是一条信息。
+            return null;
+        }
+    }
 
     /**
      * 解析一条摘要。
@@ -205,6 +255,7 @@ public final class SummaryPacket {
         m.put("tps5m", tps5m);
         m.put("tps15m", tps15m);
         m.put("msptAvg", msptAvg);
+        m.put("pushIntervalSec", pushIntervalSec);
         return m;
     }
 }

@@ -26,10 +26,12 @@ class SummaryTest {
     }
 
     private static SummaryPacket okPacket(String id, long collectedAt, double tps, int players) {
+        // 三个窗口故意用不同值：此前三个都填同一个数，于是把 tps5m / tps15m 读取键
+        // 互换也测不出来（读到的还是同一个数）。
         return SummaryPacket.parse(json("{\"v\":1,\"kind\":\"summary\",\"server\":\"" + id
             + "\",\"sentAt\":" + collectedAt + ",\"collectedAt\":" + collectedAt
             + ",\"alive\":true,\"players\":" + players
-            + ",\"tps1m\":" + tps + ",\"tps5m\":" + tps + ",\"tps15m\":" + tps
+            + ",\"tps1m\":" + tps + ",\"tps5m\":" + (tps - 0.1) + ",\"tps15m\":" + (tps - 0.2)
             + ",\"msptAvg\":12.0}"));
     }
 
@@ -49,6 +51,8 @@ class SummaryTest {
         assertTrue(p.collectorAlive());
         assertEquals(7, p.playerCount());
         assertEquals(19.98, p.tps1m(), 1e-9);
+        assertEquals(19.9, p.tps5m(), 1e-9);
+        assertEquals(19.8, p.tps15m(), 1e-9);
         assertEquals(12.5, p.msptAvg(), 1e-9);
     }
 
@@ -117,12 +121,16 @@ class SummaryTest {
     @Test
     @DisplayName("NaN / Infinity 当作没有值（防御后端发出非法浮点）")
     void nanAndInfinityTreatedAsMissing() {
-        SummaryPacket p = SummaryPacket.parse(json(
-            "{\"v\":1,\"kind\":\"summary\",\"server\":\"x\",\"sentAt\":1,\"collectedAt\":1,"
-                + "\"alive\":true,\"tps1m\":\"NaN\"}"));
-        // Gson 把字符串 "NaN" getAsDouble 时可能抛，也可能给出 NaN——两种都必须落到 null。
-        if (p != null) {
-            assertNull(p.tps1m(), "NaN 绝不能当作一个可比较的读数");
+        // 这里刻意断言 p 非 null：只写 "if (p != null) assertNull(...)" 的话，
+        // 一旦解析开始整包拒绝，p 就是 null，测试什么都不检查、照样绿——
+        // 那是一种比没有测试更糟的假绿。
+        String[] bad = {"\"NaN\"", "\"Infinity\"", "\"-Infinity\"", "1e999"};
+        for (String raw : bad) {
+            SummaryPacket p = SummaryPacket.parse(json(
+                "{\"v\":1,\"kind\":\"summary\",\"server\":\"x\",\"sentAt\":1,\"collectedAt\":1,"
+                    + "\"alive\":true,\"tps1m\":" + raw + "}"));
+            assertNotNull(p, "单个非法浮点不应导致整包被拒：" + raw);
+            assertNull(p.tps1m(), "非法浮点绝不能当作可比较的读数：" + raw);
         }
     }
 
@@ -160,8 +168,10 @@ class SummaryTest {
         NetworkView view = new NetworkView();
         List<NetworkView.Node> nodes = view.snapshot(1000L, 10, List.of("survival", "creative"));
         assertEquals(2, nodes.size(), "配置里声明的后端即使没数据也必须列出来");
-        assertEquals(NetworkView.State.NO_DATA, nodes.get(0).state());
-        assertEquals(NetworkView.State.NO_DATA, nodes.get(1).state());
+        // 按 id 断言而不是 get(0)/get(1)：后者隐式依赖排序，实现一改排序就会
+        // 因为「两台都是 NO_DATA」而侥幸通过，什么也测不到。
+        assertEquals(NetworkView.State.NO_DATA, find(nodes, "survival").state());
+        assertEquals(NetworkView.State.NO_DATA, find(nodes, "creative").state());
     }
 
     @Test
@@ -264,6 +274,176 @@ class SummaryTest {
     }
 
     @Test
+    @DisplayName("阈值边界：15.00 / 18.00 两点与后端闭区间口径一致")
+    void tpsTierBoundariesAreClosedLikeBackend() {
+        // 后端 ThresholdColors 用 value <= threshold，所以恰好等于阈值就该报警。
+        // 这里此前写成开区间（<），于是 15.00 / 18.00 两个点两边着色相反——
+        // 同一份数据在两个面板上颜色不同，是最伤信任的一种不一致。
+        assertEquals(NetworkRenderer.Level.CRITICAL, NetworkRenderer.tpsCell(15.0).level(),
+            "恰好 15.00 必须是 CRITICAL（与后端 <= 同口径）");
+        assertEquals(NetworkRenderer.Level.CRITICAL, NetworkRenderer.tpsCell(14.99).level());
+        assertEquals(NetworkRenderer.Level.WARN, NetworkRenderer.tpsCell(15.01).level());
+        assertEquals(NetworkRenderer.Level.WARN, NetworkRenderer.tpsCell(18.0).level(),
+            "恰好 18.00 必须是 WARN");
+        assertEquals(NetworkRenderer.Level.OK, NetworkRenderer.tpsCell(18.01).level());
+    }
+
+    @Test
+    @DisplayName("MSPT 分级：缺失写 —，35/45/50 三档都要判对")
+    void msptCellHandlesMissingAndTiers() {
+        // msptCell 此前零覆盖：把只读全改成 OK 也测不出来，于是 MSPT 红色永不出现。
+        assertEquals("—", NetworkRenderer.msptCell(null).text(),
+            "缺失 MSPT 必须写 —，写成 0.0 等于把「没采到」读成「零耗时」");
+        assertEquals(NetworkRenderer.Level.UNKNOWN, NetworkRenderer.msptCell(null).level());
+
+        assertEquals("12.3", NetworkRenderer.msptCell(12.34).text());
+        assertEquals(NetworkRenderer.Level.OK, NetworkRenderer.msptCell(44.9).level());
+        assertEquals(NetworkRenderer.Level.WARN, NetworkRenderer.msptCell(45.0).level(),
+            "恰好 45.0 是警告线（与后端 >= 同口径）");
+        assertEquals(NetworkRenderer.Level.WARN, NetworkRenderer.msptCell(49.9).level());
+        assertEquals(NetworkRenderer.Level.CRITICAL, NetworkRenderer.msptCell(50.0).level(),
+            "恰好 50.0 是严重线");
+        assertEquals(NetworkRenderer.Level.CRITICAL, NetworkRenderer.msptCell(120.0).level());
+    }
+
+    @Test
+    @DisplayName("四种状态行逐格断言 text 与 level（未知绝不能是绿色）")
+    void everyStateRowHasCorrectLevels() {
+        long now = 100_000L;
+        NetworkView view = new NetworkView();
+        // OK
+        view.onPacket(okPacket("ok", now - 1_000L, 20.0, 7));
+        // STALE（age 120s > 3×10s）
+        view.onPacket(okPacket("stale", now - 120_000L, 19.5, 3));
+        // COLLECTOR_DEAD
+        view.onPacket(SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"dead\",\"sentAt\":" + (now - 1000)
+                + ",\"collectedAt\":" + (now - 1000) + ",\"alive\":false,"
+                + "\"players\":5,\"tps1m\":19.5,\"msptAvg\":10.0}")));
+        List<NetworkView.Node> nodes = view.snapshot(now, 10, List.of("nodata"));
+
+        NetworkRenderer.Row ok = NetworkRenderer.renderOne(find(nodes, "ok"));
+        assertEquals("正常", ok.cells().get(1).text());
+        assertEquals("20.00", ok.cells().get(2).text());
+        assertEquals(NetworkRenderer.Level.OK, ok.cells().get(2).level());
+        assertEquals("12.0", ok.cells().get(3).text());
+        assertEquals(NetworkRenderer.Level.OK, ok.cells().get(3).level());
+        assertEquals("7", ok.cells().get(4).text());
+        assertEquals(NetworkRenderer.Level.OK, ok.cells().get(4).level());
+
+        NetworkRenderer.Row stale = NetworkRenderer.renderOne(find(nodes, "stale"));
+        assertEquals("数据过期", stale.cells().get(1).text());
+        assertEquals(NetworkRenderer.Level.UNKNOWN, stale.cells().get(1).level(),
+            "「数据过期」绝不能标 OK");
+        assertEquals("19.50", stale.cells().get(2).text(), "过期行仍显示最后已知值");
+        assertEquals(NetworkRenderer.Level.UNKNOWN, stale.cells().get(5).level(),
+            "年龄格必须标 UNKNOWN——它的主体是「过期了」这件事");
+
+        NetworkRenderer.Row dead = NetworkRenderer.renderOne(find(nodes, "dead"));
+        assertEquals("采集已停", dead.cells().get(1).text());
+        for (int i = 1; i <= 5; i++) {
+            assertEquals(NetworkRenderer.Level.UNKNOWN, dead.cells().get(i).level(),
+                "采集已停的行整行都必须 UNKNOWN，第 " + i + " 格被标成了别的");
+        }
+
+        NetworkRenderer.Row none = NetworkRenderer.renderOne(find(nodes, "nodata"));
+        assertEquals("无数据", none.cells().get(1).text());
+        for (int i = 0; i < 6; i++) {
+            assertEquals(NetworkRenderer.Level.UNKNOWN, none.cells().get(i).level(),
+                "无数据的行整行都必须 UNKNOWN，第 " + i + " 格被标成了别的");
+        }
+    }
+
+    @Test
+    @DisplayName("汇总行整串等值断言（不靠 contains 蒙对）")
+    void summaryLineIsExact() {
+        NetworkView view = new NetworkView();
+        List<NetworkView.Node> none = view.snapshot(1000L, 10, List.of("a"));
+        assertEquals("后端 1 个：正常 0 · 无数据 1 ｜ 全网 TPS — ｜ 在线合计 —",
+            NetworkRenderer.summaryLine(none, null, null));
+
+        long now = 100_000L;
+        NetworkView mixed = new NetworkView();
+        mixed.onPacket(okPacket("a", now - 1_000L, 20.0, 10));
+        mixed.onPacket(okPacket("b", now - 1_000L, 10.0, 5));
+        mixed.onPacket(okPacket("c", now - 120_000L, 2.0, 1));   // STALE
+        List<NetworkView.Node> nodes = mixed.snapshot(now, 10, List.of("d"));
+        Double avg = NetworkView.averageTps1m(nodes);
+        Integer players = NetworkView.totalPlayers(nodes);
+        assertEquals("后端 4 个：正常 2 · 数据过期 1 · 无数据 1 ｜ 全网 TPS 15.00 ｜ 在线合计 15",
+            NetworkRenderer.summaryLine(nodes, avg, players));
+    }
+
+    @Test
+    @DisplayName("聚合边角：OK 后端缺 tps1m 不参与平均、也不 NPE")
+    void aggregateSkipsOkNodeWithMissingTps() {
+        NetworkView view = new NetworkView();
+        long now = 100_000L;
+        view.onPacket(okPacket("has", now - 1_000L, 20.0, 4));
+        // alive=true、数据新鲜，但没有 tps1m（后端 performance 模块被关掉）
+        view.onPacket(SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"notps\",\"sentAt\":" + (now - 1000)
+                + ",\"collectedAt\":" + (now - 1000) + ",\"alive\":true,\"players\":2}")));
+
+        List<NetworkView.Node> nodes = view.snapshot(now, 10, List.of());
+        assertEquals(20.0, NetworkView.averageTps1m(nodes), 1e-9,
+            "缺 tps1m 的 OK 后端不能参与平均，更不能让 averageTps1m 抛 NPE");
+        assertEquals(6, NetworkView.totalPlayers(nodes), "玩家数仍然可以合计");
+    }
+
+    @Test
+    @DisplayName("聚合边角：OK 后端 players=-1 不参与合计（不能凭空少人）")
+    void aggregateSkipsUnavailablePlayerCount() {
+        NetworkView view = new NetworkView();
+        long now = 100_000L;
+        view.onPacket(okPacket("a", now - 1_000L, 20.0, 10));
+        view.onPacket(SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"b\",\"sentAt\":" + (now - 1000)
+                + ",\"collectedAt\":" + (now - 1000) + ",\"alive\":true,\"tps1m\":20.0}")));
+
+        List<NetworkView.Node> nodes = view.snapshot(now, 10, List.of());
+        assertEquals(10, NetworkView.totalPlayers(nodes),
+            "-1 是「没采到」，混进合计会让在线人数凭空少 1");
+    }
+
+    @Test
+    @DisplayName("过期阈值跟随后端自带的上报间隔，而不是写死的 10 秒")
+    void staleWindowFollowsPacketInterval() {
+        // 后端把 push-interval-seconds 调成 60 秒：代理必须按 3×60=180 秒判过期。
+        // 否则每两轮上报之间都会闪一段「数据过期」，看起来像故障。
+        long now = 200_000L;
+        SummaryPacket slow = SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"slow\",\"sentAt\":" + (now - 70_000L)
+                + ",\"collectedAt\":" + (now - 70_000L) + ",\"alive\":true,"
+                + "\"players\":1,\"tps1m\":20.0,\"pushIntervalSec\":60}"));
+        assertEquals(60, slow.pushIntervalSec());
+
+        NetworkView view = new NetworkView();
+        view.onPacket(slow);
+        assertEquals(NetworkView.State.OK, view.snapshot(now, 10, List.of()).get(0).state(),
+            "70 秒前发的、但该后端每 60 秒才发一次，不应当判过期");
+
+        // 超过 3×60=180 秒才该过期
+        assertEquals(NetworkView.State.STALE,
+            view.snapshot(now + 120_000L, 10, List.of()).get(0).state());
+    }
+
+    @Test
+    @DisplayName("越界/缺失的 pushIntervalSec 回退默认阈值，不能被伪造的极值骗过")
+    void absurdPushIntervalFallsBackToDefault() {
+        assertEquals(0, SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"x\",\"sentAt\":1,\"collectedAt\":1,"
+                + "\"alive\":true,\"pushIntervalSec\":0}")).pushIntervalSec());
+        assertEquals(0, SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"x\",\"sentAt\":1,\"collectedAt\":1,"
+                + "\"alive\":true,\"pushIntervalSec\":999999}")).pushIntervalSec(),
+            "极大值会让该后端永远显示正常——必须当成「没提供」");
+        assertEquals(0, SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"x\",\"sentAt\":1,\"collectedAt\":1,"
+                + "\"alive\":true}")).pushIntervalSec(), "旧版后端没有这个字段");
+    }
+
+    @Test
     @DisplayName("渲染：采集已死时整行都不给数字（陈数据不能当现状）")
     void collectorDeadRowShowsNoNumbers() {
         NetworkView view = new NetworkView();
@@ -291,6 +471,48 @@ class SummaryTest {
         assertFalse(line.contains("0.00"), "不能出现 0.00：" + line);
     }
 
+    @Test
+    @DisplayName("列宽：中文按 2 格算，填充后各列起点对齐")
+    void columnsAlignAfterPadding() {
+        // 中文与 ASCII 的宽度不同，「数据过期」(4 字) 与「正常」(2 字) 差一倍；
+        // 不填充时每行第 3 列起都在不同位置，纵向比较无从谈起。
+        assertEquals(4, NetworkRenderer.displayWidth("正常"));
+        assertEquals(8, NetworkRenderer.displayWidth("数据过期"));
+        assertEquals(5, NetworkRenderer.displayWidth("19.84"));
+
+        assertEquals("正常    ", NetworkRenderer.padTo("正常", 8));
+        assertEquals("19.84", NetworkRenderer.padTo("19.84", 4),
+            "超出目标宽度时原样返回，不能截断");
+    }
+
+    @Test
+    @DisplayName("列宽：取表头与所有行的最大值，不是第一行")
+    void columnWidthsUseMaxAcrossRows() {
+        long now = 100_000L;
+        NetworkView view = new NetworkView();
+        // 第一行是最窄的「正常」，后面再来一个最宽的「数据过期」——
+        // 只用第一行算宽度的话，后面的行会把它挤歪。
+        view.onPacket(okPacket("s", now - 1_000L, 20.0, 7));
+        view.onPacket(okPacket("t", now - 120_000L, 19.0, 1));
+        List<NetworkView.Node> nodes = view.snapshot(now, 10, List.of("a-very-long-backend-name"));
+        List<NetworkRenderer.Row> rows = NetworkRenderer.render(nodes);
+        int[] w = NetworkRenderer.columnWidths(rows, NetworkRenderer.HEADERS);
+
+        assertEquals(NetworkRenderer.displayWidth("a-very-long-backend-name"), w[0],
+            "第 1 列要容得下最长的后端名");
+        assertEquals(NetworkRenderer.displayWidth("数据过期"), w[1],
+            "第 2 列要容得下最宽的状态文案（而不是第一行的「正常」）");
+        assertEquals(NetworkRenderer.displayWidth("TPS(1m)"), w[2]);
+
+        // 不变式：任一格的宽度都不超过它所在列的宽度，否则填充是假的。
+        for (NetworkRenderer.Row row : rows) {
+            for (int i = 0; i < row.cells().size(); i++) {
+                assertTrue(NetworkRenderer.displayWidth(row.cells().get(i).text()) <= w[i],
+                    "第 " + i + " 格超出了列宽：" + row.cells().get(i).text());
+            }
+        }
+    }
+
     private static NetworkView.Node find(List<NetworkView.Node> nodes, String id) {
         for (NetworkView.Node n : nodes) {
             if (n.serverId().equals(id)) return n;
@@ -299,6 +521,38 @@ class SummaryTest {
     }
 
     // ==================== 验收修复后新增：防回归 ====================
+
+    @Test
+    @DisplayName("新增可选字段不破坏旧包：不带 pushIntervalSec 的包照常解析")
+    void optionalFieldKeepsOlderPacketsWorking() {
+        // 这条钉住"加字段不必升 PROTOCOL_VERSION"这个决定。如果哪天有人为了加一个可选
+        // 字段就升号，旧代理会整包拒收——升级窗口期面板全空，正是要避免的。
+        SummaryPacket old = SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"legacy\",\"sentAt\":1,\"collectedAt\":1,"
+                + "\"alive\":true,\"players\":2,\"tps1m\":19.9}"));
+        assertNotNull(old, "旧版后端（没有新字段）的包必须照常被接受");
+        assertEquals(0, old.pushIntervalSec(), "缺字段时是 0 = 没提供");
+        assertEquals(19.9, old.tps1m(), 1e-9);
+
+        // 反向：新包里的未知键也不能让旧逻辑崩（解析按 key 取值，多余键被忽略）。
+        SummaryPacket extra = SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"future\",\"sentAt\":1,\"collectedAt\":1,"
+                + "\"alive\":true,\"somethingNew\":123}"));
+        assertNotNull(extra);
+        assertEquals("future", extra.serverId());
+    }
+
+    @Test
+    @DisplayName("peekVersion 只为日志服务：坏包也能报出对方版本")
+    void peekVersionReadsVersionEvenWhenParseFails() {
+        // 版本不兼容时 parse 返回 null，日志若只报本端版本，服主看不出该升哪一边。
+        assertEquals(7, SummaryPacket.peekVersion(json(
+            "{\"v\":7,\"kind\":\"summary\",\"server\":\"x\"}")));
+        assertNull(SummaryPacket.peekVersion(json("not json")));
+        assertNull(SummaryPacket.peekVersion(json("{\"kind\":\"summary\"}")),
+            "没有 v 字段时是 null（日志会写「无法识别」）");
+        assertNull(SummaryPacket.peekVersion(null));
+    }
 
     @Test
     @DisplayName("超长 serverId 直接拒（否则撑爆堆、撑爆聊天行）")
