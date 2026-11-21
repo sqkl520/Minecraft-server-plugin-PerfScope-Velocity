@@ -113,6 +113,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME#v}"
+          echo "RELEASE_NAME=$TAG" >> "$GITHUB_ENV"
           POM=$(mvn -B -ntp -q help:evaluate -Dexpression=project.version -DforceStdout)
           echo "tag=$TAG pom=$POM"
           if [ "$TAG" != "$POM" ]; then
@@ -134,8 +135,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          # 标题不带 v，与主仓 PerfScope 的发布格式一致
-          name: ${{ github.ref_name }}
+          # 标题不带 v，与主仓 PerfScope 的发布格式一致（tag 是 v1.4.5-SNAPSHOT-fix2，
+          # 标题是 1.4.5-SNAPSHOT-fix2）。yaml 侧没有字符串裁剪，所以用 shell 预处理。
+          name: ${{ env.RELEASE_NAME }}
           files: target/PerfScope-Velocity-*.jar
           fail_on_unmatched_files: true
           prerelease: true
