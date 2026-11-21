@@ -2,8 +2,10 @@
 
 PerfScope 的 **Velocity 代理侧**：接收各后端（Paper）上报的性能摘要，用 `/pscope network` 一屏看全网。
 
-> 这个目录暂时放在主仓 `PerfScope/` 的旁边，**还不是一个独立的 git 仓库**。
-> 它有自己的 `pom.xml`、自己的测试、自己的构建产物，可以独立 `mvn package`。
+> **独立仓库**：<https://github.com/sqkl520/Minecraft-server-plugin-PerfScope-Velocity>
+>
+> 后端（Paper）插件在 <https://github.com/sqkl520/Minecraft-server-plugin-PerfScope>。
+> 两个仓库的 artifact 版本保持同步。
 
 ## 它做什么
 
@@ -53,6 +55,18 @@ network:
 
 还要保证代理的转发模式是 `traditional` / `legacy`。**Velocity 的 `modern` 转发模式下
 plugin messaging 不可用**，这是「配了但代理收不到」最常见的原因。
+
+## 两个仓库的关系
+
+| 仓库 | 装在哪 | 作用 |
+|---|---|---|
+| [Minecraft-server-plugin-PerfScope](https://github.com/sqkl520/Minecraft-server-plugin-PerfScope) | 每个 Paper 后端 | 采集指标 + 发送摘要 |
+| 本仓库 | Velocity 代理 | 接收摘要 + 渲染 `/pscope network` |
+
+**版本必须共存**：`SummaryPacket.PROTOCOL_VERSION` 决定能不能通信，两侧必须一致。
+artifact 版本（`1.4.5-SNAPSHOT-fix1` 这种）只决定"这是哪一版代码"，两者不要混。
+协议版本不一致时，高版本发的包会被低版本**直接丢弃并记日志**，而不是"尽力解析"——
+后者会把新字段读成缺失，正是本项目反复修的那类静默失真。
 
 ## 构建
 
