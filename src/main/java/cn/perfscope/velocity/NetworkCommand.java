@@ -43,6 +43,9 @@ public final class NetworkCommand implements SimpleCommand {
         // 连"出问题想重新统计"都做不到。
         if (args.length > 1 && "reset".equalsIgnoreCase(args[1])) {
             plugin.view().clear();
+            // 绑定表也一起清：换过后端 / 改过 server-id 之后，旧的"某个 id 归哪条后端"
+            // 若留着，新后端会被判成抢占而永久丢包——那是与 reset 语义直接矛盾的。
+            plugin.sourceBinder().clear();
             src.sendMessage(Component.text("已清空已收到的跨服摘要，等待后端重新上报。", NamedTextColor.YELLOW));
             return;
         }
@@ -51,7 +54,9 @@ public final class NetworkCommand implements SimpleCommand {
         List<NetworkView.Node> nodes = plugin.view().snapshot(now, DEFAULT_PUSH_INTERVAL_SEC, expectedServers());
 
         Double avgTps = NetworkView.averageTps1m(nodes);
-        Integer totalPlayers = NetworkView.totalPlayers(nodes);
+        // 合计带回"没计入多少"：只给一个数字会被读成"全服在线"，而它只覆盖 OK 后端。
+        // 详见 NetworkView.PlayerTotal 与 NetworkRenderer.playersTotalText。
+        NetworkView.PlayerTotal totalPlayers = NetworkView.totalPlayers(nodes);
 
         src.sendMessage(Component.text(
             NetworkRenderer.summaryLine(nodes, avgTps, totalPlayers), NamedTextColor.GRAY));
