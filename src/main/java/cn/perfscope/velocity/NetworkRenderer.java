@@ -118,30 +118,40 @@ public final class NetworkRenderer {
                     cell("—", Level.UNKNOWN),
                     cell("—", Level.UNKNOWN),
                     cell("—", Level.UNKNOWN),
-                    cell(formatAge(node.ageMs()) + "（数字已冻结）", Level.UNKNOWN)
+                    cell(formatAge(node.dataAgeMs()) + "（数字已冻结）", Level.UNKNOWN)
                 );
             case CLOCK_SKEW:
-                // 时间戳不可信：数可以显示（服主能看出"最后是 19.8"，也知道那是哪一档），
-                // 但整行必须 UNKNOWN，且年龄格**不能**写成"0 秒前"——那正是伪造时间戳
-                // 想换来的那句话。改写成"超前 N"或"—"，让人知道问题出在时间而不是负载。
+                // 时间戳不可信：**整行 UNKNOWN**，数值格也强制降级。理由见
+                // {@link #demote} 的说明——一个伪造未来/荒谬时间戳的后端，它的 TPS 值同样
+                // 没有任何理由被信任（那条包整体就是不可信的），给它绿色 20.00 等于让伪造
+                // 换到"看起来健康"。
+                //
+                // 年龄格**不能**写成"0 秒前"——那正是伪造时间戳想换来的那句话。
+                // 改写成"早 N"/"落后 N"或"—"，让人知道问题出在时间而不是负载。
                 return row(
                     idCell(node),
                     cell("时钟异常", Level.UNKNOWN),
-                    tpsCell(node.packet().tps1m()),
-                    msptCell(node.packet().msptAvg()),
-                    playerCell(node.packet().playerCount()),
+                    demote(tpsCell(node.packet().tps1m())),
+                    demote(msptCell(node.packet().msptAvg())),
+                    demote(playerCell(node.packet().playerCount())),
                     cell(clockDetail(node), Level.UNKNOWN)
                 );
             case STALE:
                 // 数据是陈的：数值仍然显示（服主能看出"最后是 19.8"），但整行标 UNKNOWN，
                 // 且明确写出"已过期"，避免被当成当前值。
+                //
+                // **数值格也真的降级成 UNKNOWN**（以前注释写着"整行标 UNKNOWN"，实现却只降了
+                // 状态/年龄两格，于是过期行上仍可能挂着绿色的 19.50）。这一条与 CLOCK_SKEW 同源：
+                // {@link Level#UNKNOWN} 的定义里本来就写着"没数据 / 采集器已死 / 失联"，
+                // 而失联行的读数只说"当时是多少"，不构成"现在是健康的"这个结论。
+                // 文字保留、颜色降级，两者不矛盾：读者仍能读到 19.50，只是不会被涂成绿色。
                 return row(
                     idCell(node),
                     cell("数据过期", Level.UNKNOWN),
-                    tpsCell(node.packet().tps1m()),
-                    msptCell(node.packet().msptAvg()),
-                    playerCell(node.packet().playerCount()),
-                    cell(formatAge(node.ageMs()) + "（可能空服）", Level.UNKNOWN)
+                    demote(tpsCell(node.packet().tps1m())),
+                    demote(msptCell(node.packet().msptAvg())),
+                    demote(playerCell(node.packet().playerCount())),
+                    cell(formatAge(node.dataAgeMs()) + "（可能空服）", Level.UNKNOWN)
                 );
             case OK:
             default:
@@ -151,9 +161,31 @@ public final class NetworkRenderer {
                     tpsCell(node.packet().tps1m()),
                     msptCell(node.packet().msptAvg()),
                     playerCell(node.packet().playerCount()),
-                    cell(formatAge(node.ageMs()), Level.OK)
+                    cell(formatAge(node.dataAgeMs()), Level.OK)
                 );
         }
+    }
+
+    /**
+     * 把一个格子的语义级别压到 {@link Level#UNKNOWN}，**保留文字**。
+     *
+     * <p><b>为什么需要这个函数，而不是直接在 {@code tpsCell} 里按状态判断</b>：
+     * {@code tpsCell} 的职责是"这个数值落在哪一档"，与"这行数据可不可信"是两个问题。
+     * 把它们混进同一个函数，会让"19.50 是 OK 档"这件事取决于调用方有没有先判状态——
+     * 那类耦合正是本项目反复出问题的地方。所以分级保持纯粹，降级单独一步。</p>
+     *
+     * <p><b>为什么要降级而不是干脆不显示</b>：数字本身有信息（"最后是 19.5"能让服主
+     * 判断是不是在自己刚改完配置之后停的），抹掉它等于丢掉一条线索。该降的是
+     * **结论**——绿色会被读成"这台很健康"，而过期行/时钟异常行恰恰不支持这个结论。</p>
+     *
+     * <p><b>本批的教训（问题 E）</b>：注释与 CHANGELOG 都写「整行 UNKNOWN」，
+     * 实测却是 {@code 19.90/OK}、{@code 1.5/OK}、{@code 3/OK}——只有 id/状态/年龄三格
+     * 是灰的。一个伪造未来时间戳的后端因此能拿到<b>绿色的 20.00</b>。
+     * 注释承诺的比实现多，是最难发现的一种文档失真，因为它连"改哪一份"都说不清。
+     * 现在实现追上了注释。</p>
+     */
+    static Cell demote(Cell c) {
+        return c.level() == Level.UNKNOWN ? c : cell(c.text(), Level.UNKNOWN);
     }
 
     /**
@@ -269,7 +301,17 @@ public final class NetworkRenderer {
         if (min < 60) {
             return min + "分钟前";
         }
-        return (min / 60) + "小时前";
+        long hour = min / 60;
+        if (hour < 24) {
+            return hour + "小时前";
+        }
+        long day = hour / 24;
+        if (day < 365) {
+            return day + "天前";
+        }
+        // 超过一年就不再往下细分到小时了（"3年12天前"读起来比"12000小时前"有用得多，
+        // 而"498888小时前"这种数字根本没法转成人能理解的时间量）。
+        return (day / 365) + "年前";
     }
 
     /**
@@ -280,27 +322,41 @@ public final class NetworkRenderer {
      *
      * <p>超前量按 {@code aheadMs} 而不是按年龄算——后者的符号在进入本状态时已经被判定为
      * 不可用，再用它就等于拿坏数据算坏数据。</p>
+     *
+     * <p><b>两个方向分开写</b>（{@link NetworkView.ClockIssue#FUTURE} / {@link NetworkView.ClockIssue#PAST}）：
+     * 一个是"该往回拨"，一个是"该往前拨"，修法相反。只写"时间戳不可信"会让服主
+     * 两边都试一遍。</p>
      */
     static String clockDetail(NetworkView.Node node) {
         long ahead = node.aheadMs();
+        if (node.clockIssue() == NetworkView.ClockIssue.PAST) {
+            // 过去侧：ahead 是负数（快照比到达时刻早得多）。写成"早"会与未来侧混成一句话，
+            // 所以这里用"落后"，并把量取正。
+            return "落后 " + span(-ahead) + "（时间戳在过去）";
+        }
         if (ahead <= 0L) {
-            // 理论上进不了这里（CLOCK_SKEW 必须来自超前判定）；留一条降级路径，
+            // 理论上进不了这里（FUTURE 必须来自超前判定）；留一条降级路径，
             // 宁肯写 — 也不要凭空编一个时间差。
             return "时间戳不可信";
         }
-        long sec = ahead / 1000L;
+        return "早 " + span(ahead) + "（时间戳在未来）";
+    }
+
+    /** 把毫秒差渲染成"1天3小时"/"20分钟"/"5秒"这种两段式（只取最大的两个非零单位）。 */
+    private static String span(long ms) {
+        long sec = Math.max(0L, ms) / 1000L;
         if (sec < 60) {
-            return "早 " + sec + "秒（时间戳在未来）";
+            return sec + "秒";
         }
         long min = sec / 60;
         if (min < 60) {
-            return "早 " + min + "分钟（时间戳在未来）";
+            return min + "分钟";
         }
         long hour = min / 60;
         if (hour < 24) {
-            return "早 " + hour + "小时（时间戳在未来）";
+            return hour + "小时";
         }
-        return "早 " + (hour / 24) + "天（时间戳在未来）";
+        return (hour / 24) + "天";
     }
 
     /**
@@ -527,6 +583,26 @@ public final class NetworkRenderer {
      */
     static int displayWidth(String s) {
         if (s == null) return 0;
+        // ASCII 快路径：**整串**都是 U+0000..U+007F 时，每个字符恰好占 1 格，
+        // 宽度 = 长度。判据必须看完整串，不能"扫描到第一个非 ASCII 就停、把前面
+        // 那段 ASCII 单独按 1 格算"——那是错的，且错法很隐蔽：
+        // `1️⃣` 是 `1` + U+FE0F + U+20E3，一个字素簇、宽 2；把前缀 `1` 先当 1 格剥掉，
+        // 剩下的 VS16 与 keycap 圈各自是 0 格，整串就变成 1 格。实测这条路径能让
+        // keycap 与「ASCII 基字符 + VS16」两类输入全部偏窄，所以只允许整串 ASCII。
+        //
+        // 为什么仍然值得：`columnWidths` 对全表每格各算一次宽度，而后端名/状态/TPS/
+        // MSPT/玩家数在真实部署里几乎全是 ASCII，一次字符扫描比逐字素簇的二分查找
+        // 便宜得多，也不产生 Cluster 对象。
+        boolean ascii = true;
+        for (int i = 0; i < s.length(); i++) {
+            if (s.charAt(i) >= 0x80) {
+                ascii = false;
+                break;
+            }
+        }
+        if (ascii) {
+            return s.length();
+        }
         int w = 0;
         for (int i = 0; i < s.length(); ) {
             Cluster c = clusterAt(s, i);
@@ -555,17 +631,36 @@ public final class NetworkRenderer {
         int width = isWide(cp) ? 2 : 1;
 
         // 吸收后续的"附加"码点：ZWJ 连字、变体选择符、肤色修饰、组合记号。
+        //
+        // <b>ZWJ 只在"后面确实跟着可连接字符"时才吸收</b>。无条件吞掉 ZWJ 后的一个码点
+        // （修复前的写法）会让一个**孤立的**尾部 ZWJ 也被当成连字：实测
+        // {@code displayWidth("x‍")=2}（真实渲染是 1 格），于是
+        // {@code padTo("x‍", 3)} 只返回宽度 2 的串，破坏了"返回串恰好 width 格"
+        // 这个所有调用方唯一依赖的契约（4000 例含 ZWJ 的样本里 235 例破约）。
+        //
+        // 判据是"ZWJ 后面那个码点会不会真的与前一个合成一个字素"：emoji ZWJ 序列里
+        // 后面总是另一个 emoji 基字符（W/F 或已属于 emoji 区段）。与其去枚举"哪些码点能连接"，
+        // 更稳的判据是**至少它得是个基字符**——控制符、另一个 ZWJ、变体选择符都不是。
         boolean emojiPresentation = false;
         while (i < s.length()) {
             int next = s.codePointAt(i);
             if (next == ZERO_WIDTH_JOINER) {
-                // ZWJ：把 ZWJ 与**下一个基字符**一起吸进来，整簇宽度不变。
-                // 这正是 `👨‍👩‍👧‍👦` 算 2 格而不是 8 格的原因。
-                i += 1;
-                if (i < s.length()) {
-                    int joined = s.codePointAt(i);
-                    i += Character.charCount(joined);
+                // 先看 ZWJ 之后有没有可连接的基字符。没有就把它当**尾部**格式符：
+                // 吃掉这一个码点、但不吸收任何东西、也不把簇标成 emoji 呈现。
+                int afterZwj = i + Character.charCount(next);
+                if (afterZwj >= s.length()) {
+                    i = afterZwj;
+                    break;
                 }
+                int joined = s.codePointAt(afterZwj);
+                if (!isJoinableBase(joined)) {
+                    // ZWJ 后面不是基字符（例如又一个 ZWJ / VS16 / 控制符）：
+                    // 只吃掉 ZWJ 自己，剩下的交给下一轮判断。这正是
+                    // "x‍‍" 这类串不该被算成 3 格的原因。
+                    i = afterZwj;
+                    continue;
+                }
+                i = afterZwj + Character.charCount(joined);
                 emojiPresentation = true;
                 continue;
             }
@@ -628,6 +723,30 @@ public final class NetworkRenderer {
         return cp >= 0x1F3FB && cp <= 0x1F3FF;
     }
 
+    /**
+     * 这个码点能不能作为 ZWJ <b>右侧</b>的连接对象（即"ZWJ 真的把两个字符合成了一个字素"）。
+     *
+     * <p>判据刻意宽：只要它<b>是个基字符</b>（不是控制符、不是格式符、不是附加记号）
+     * 就认为 ZWJ 起到了连接作用。真实的 ZWJ 序列几乎都是 emoji（{@code 👨‍👩‍👧‍👦}、
+     * {@code 👩‍💻}、{@code 🏳️‍🌈}），它们都是 W/F 码点，一定会通过这一条。</p>
+     *
+     * <p><b>为什么不用"必须是 W/F"这个更严格的判据</b>：ZWJ 序列的右侧并不总是宽字符
+     * （例如 {@code ❤️‍🔥} 里 VS16 之后还能再接 ZWJ），而且这个函数只回答"该不该吸收"，
+     * 不回答"宽度是多少"——宽度由 {@link #isWide} 分别算。在这里多判一层会引入
+     * "吸收规则与宽度规则不同步"的新风险。</p>
+     *
+     * <p><b>为什么尾部/连续 ZWJ 必须返回 false</b>：那是本批修的那个 bug 的形状——
+     * {@code "x‍"} 被算成 2 格（真实 1 格），于是 {@code padTo} 少补一格。
+     * 控制符与格式符（含 ZWJ 自身、VS16）都不该被"连接"进前一个字素。</p>
+     */
+    private static boolean isJoinableBase(int cp) {
+        if (Character.isISOControl(cp)) {
+            return false;
+        }
+        // 格式符（Cf：ZWJ/ZWNJ/BOM/软连字符）与附加记号都不能作为被连接的对象。
+        return !isZeroWidth(cp);
+    }
+
     /** 该码点的 East Asian Width 是否为 W / F（二分查找 {@link #WIDE_RANGES}）。 */
     private static boolean isWide(int cp) {
         int lo = 0;
@@ -662,7 +781,26 @@ public final class NetworkRenderer {
     static String padTo(String s, int width) {
         if (s == null) return "";
         if (width <= 0) return "";
-        int w = displayWidth(s);
+        return padToKnown(s, width, displayWidth(s));
+    }
+
+    /**
+     * 与 {@link #padTo} 同语义，但**宽度由调用方给出**（{@code knownWidth}），本方法不再量。
+     *
+     * <p>{@code knownWidth < 0} 表示"调用方没有这格的宽度"（越界格等），此时退回自行测量。
+     * 这个哨兵选负数而不是 0：宽度 0 是一个**合法**值（空串、纯组合记号），拿 0 当"未知"
+     * 会让空格的格子走错分支。</p>
+     *
+     * <p>为什么把两个方法拆开而不是给 {@link #padTo} 加一个可空参数：{@code padTo} 是
+     * 生产路径上唯一"自己量"的入口（它的契约是"给我一个串和目标宽度"），而
+     * {@link ColumnLayout#render} 走的是"我已经量过了"。两条路共用下面的折算逻辑，
+     * 于是"补几个空格"这件事在代码里仍然只有一份实现——这正是过去修过的那类
+     * "测量算 2 格、填充按 1 格算"自我矛盾 bug 的防线。</p>
+     */
+    static String padToKnown(String s, int width, int knownWidth) {
+        if (s == null) return "";
+        if (width <= 0) return "";
+        int w = knownWidth >= 0 ? knownWidth : displayWidth(s);
         if (w > width) {
             // 截断后再补一次：按字素簇切时预算未必能被占满（汉语 2 格、预算 19 →
             // 只能用到 18 格再加 1 格省略号），留下 1 格缺口就会让这一列短一格。
@@ -690,6 +828,26 @@ public final class NetworkRenderer {
     static String truncateToWidth(String s, int maxWidth) {
         if (s == null) return "";
         if (maxWidth <= 0) return "";
+        // ASCII 快路径（`idCell` 的预检走的正是这里）：U+0000..U+007F 每个字符恰好 1 格，
+        // 于是"宽度 ≤ maxWidth"退化成"长度 ≤ maxWidth"，不需要字素簇扫描，也不需要
+        // 先调一次 displayWidth。后端名在真实部署里基本都是 ASCII（`survival-1`），
+        // 而 MAX_ID_DISPLAY_WIDTH=20 意味着绝大多数名字直接命中这条。
+        //
+        // 判据与 displayWidth 的 ASCII 快路径**逐字一致**（同样以 0x80 为界），
+        // 所以两条路径不可能给出互相矛盾的宽度——这正是过去那种
+        // "测量算 2 格、截断按 1 格切"的 bug 的防线。
+        if (s.length() <= maxWidth) {
+            boolean ascii = true;
+            for (int i = 0; i < s.length(); i++) {
+                if (s.charAt(i) >= 0x80) {
+                    ascii = false;
+                    break;
+                }
+            }
+            if (ascii) {
+                return s;
+            }
+        }
         if (displayWidth(s) <= maxWidth) return s;
 
         int budget = maxWidth - ELLIPSIS_WIDTH;
@@ -709,7 +867,18 @@ public final class NetworkRenderer {
     }
 
     /**
-     * 一组行（含表头）每列的最大显示宽度，供命令层按列填充。
+     * 一组行（含表头）每列的最大显示宽度 <b>+ 每格自己的显示宽度</b>。
+     *
+     * <p><b>{@code int[]} → {@link ColumnLayout} 的返回值改了什么</b>：以前调用方拿到列宽后
+     * 由 {@link #padTo} 再对每格量一次宽度——而 {@code padTo} 为了知道要补几个空格必须量。
+     * 于是同一格的宽度在被渲染的整条链路上量了<b>三次</b>：{@code idCell} 的截断预检一次、
+     * 这里一次、{@code padTo} 一次。第三次是纯浪费：这里的循环本来就已经把每格量过了，
+     * 只是把结果丢掉了。现在把它留下来，{@link #padToKnown} 直接按已知宽度补空格。</p>
+     *
+     * <p><b>为什么不在 {@code Row}/{@code Cell} 上加字段</b>：宽度依赖"表头 + 全表"这个
+     * 上下文，单独一个 {@code Cell} 并不知道自己该多宽（同名后端在只有一台时列宽是 6、
+     * 有十台时可能是 8）。把结果挂在一个与这次渲染绑定的布局对象上，比在 {@code Cell} 里
+     * 塞一个"这次算出来的宽度"更不容易被误用成跨渲染复用。</p>
      *
      * <p><b>为什么这里要封顶</b>：宽度取全表最大值，于是任意一格超长都会把整列
      * （进而每一行）撑到那个宽度。{@link #MAX_ID_DISPLAY_WIDTH} 管住了后端名那一格，
@@ -717,22 +886,77 @@ public final class NetworkRenderer {
      * 这道总闸把单列宽度封在 {@link #MAX_CELL_WIDTH}，让"整行不超过约
      * {@code 6 × 32 + 10 = 202} 格"成为本类的一个**可断言**性质，而不是恰好成立的巧合
      * （旧实现靠"调用方按顺序算宽度"，`padTo` 自己没有防护）。</p>
-     *
-     * <p>它与 {@link #padTo} 的分工：这里决定"最多留多宽"，{@code padTo} 保证
-     * "返回的串正好这么宽"（超了截断）。两道防线各自独立成立，不再互相依赖。</p>
      */
-    static int[] columnWidths(List<Row> rows, String[] headers) {
-        int[] w = new int[headers.length];
+    static ColumnLayout columnWidths(List<Row> rows, String[] headers) {
+        int[] widths = new int[headers.length];
         for (int i = 0; i < headers.length; i++) {
-            w[i] = Math.min(MAX_CELL_WIDTH, displayWidth(headers[i]));
+            widths[i] = Math.min(MAX_CELL_WIDTH, displayWidth(headers[i]));
         }
-        for (Row row : rows) {
-            List<Cell> cells = row.cells();
-            for (int i = 0; i < cells.size() && i < w.length; i++) {
-                w[i] = Math.max(w[i], Math.min(MAX_CELL_WIDTH, displayWidth(cells.get(i).text())));
+        // 每格已算宽度；超出 headers.length 的格（理论上不会有）记 -1 表示"没量过"，
+        // 让 padToKnown 走回退路径而不是拿一个假的 0 去补空格。
+        int[][] cellWidths = new int[rows.size()][];
+        for (int r = 0; r < rows.size(); r++) {
+            List<Cell> cells = rows.get(r).cells();
+            int[] rowWidths = new int[cells.size()];
+            for (int i = 0; i < cells.size(); i++) {
+                // 注意：**不**在这里就对每格封顶。封顶是列宽的事（上面的 widths[i]），
+                // 格子的真实宽度是"它自己有多宽"，padToKnown 拿它跟列宽比才知道该补还是该截。
+                int w = displayWidth(cells.get(i).text());
+                rowWidths[i] = w;
+                if (i < widths.length) {
+                    widths[i] = Math.max(widths[i], Math.min(MAX_CELL_WIDTH, w));
+                }
             }
+            cellWidths[r] = rowWidths;
         }
-        return w;
+        return new ColumnLayout(widths, cellWidths);
+    }
+
+    /**
+     * 一次渲染的列宽布局：每列的目标宽度 + 每格已经量过的宽度。
+     *
+     * <p>把两者放在一起而不是让调用方自己拼两个数组，是为了让"某格的宽度"和"它所在列的宽度"
+     * 在类型上就是同一次计算的产物——不同次渲染的宽度混用会得到"补错格数"这种极难发现的
+     * 错位（也正是本类反复在防的那一类）喵。</p>
+     */
+    static final class ColumnLayout {
+        private final int[] columnWidths;
+        private final int[][] cellWidths;
+
+        ColumnLayout(int[] columnWidths, int[][] cellWidths) {
+            this.columnWidths = columnWidths;
+            this.cellWidths = cellWidths;
+        }
+
+        /** 第 {@code i} 列的目标宽度（已封顶 {@link #MAX_CELL_WIDTH}）。 */
+        int column(int i) {
+            return columnWidths[i];
+        }
+
+        int columnCount() {
+            return columnWidths.length;
+        }
+
+        /**
+         * 把第 {@code row} 行的第 {@code col} 格补到它所在列的宽度，<b>不再重新量宽度</b>。
+         *
+         * <p>语义与 {@link #padTo} 逐字等价（补到恰好占列宽、超宽则按宽度截断），
+         * 区别只是"宽度从哪里来"：这里来自 {@link #columnWidths} 已经算过的那一遍。
+         * 宽度未知（越界格）时退回 {@link #padTo}，保证任何调用方式都不会比旧实现更差。</p>
+         */
+        String render(int row, int col, String text) {
+            // 越界列：调用方把列号算错了。旧实现是 `padTo(text, widths[i])`，同样会在这里
+            // 抛 ArrayIndexOutOfBounds——所以"抛异常"在语义上并不算回归。但那是一行拼到一半
+            // 才炸的运行时错误，而这里的返回值只要"不比原文更糟"就够了：原样返回文本，
+            // 让这一格不被填充，而不是让整条命令失败（面板拼不出来比一列没对齐严重得多）。
+            if (col < 0 || col >= columnWidths.length) {
+                return text == null ? "" : text;
+            }
+            int target = columnWidths[col];
+            int known = (row >= 0 && row < cellWidths.length && col < cellWidths[row].length)
+                ? cellWidths[row][col] : -1;
+            return padToKnown(text, target, known);
+        }
     }
 
     /**
