@@ -60,6 +60,50 @@ public final class SummaryPacket {
     /** 合理的玩家数上限（防止伪造包把聚合值撑到荒谬的量级）。 */
     private static final int MAX_PLAYERS = 100_000;
 
+    /**
+     * 「快照时间最多能比此刻的对方时间轴晚多少」——超过就判为时间戳不可信（毫秒）。
+     *
+     * <p><b>为什么必须有这条上界。</b>此前 {@link #ageMs(long)} 只判 {@code collectedAt <= 0}
+     * （缺值分支），对"在未来"没有任何约束，于是 {@code Math.max(0, now - collectedAt)} 把
+     * 未来的时间戳 clamp 成 {@code 0} —— 快照年龄恒为 0，状态恒为 OK。一个伪造的 2100 年
+     * 时间戳就能让一台已经死掉的后端在面板上<b>永久</b>"正常"。这里与 {@link #pushIntervalSec()}
+     * 的 1–300 钳制是同一个理由（"否则一个伪造的极大值会让该后端永远显示正常"），
+     * 只是当时漏了时间戳这一条。</p>
+     *
+     * <p><b>为什么是 60 秒。</b>比对基准是<b>包到达的那一刻</b>（见 {@link #PacketAnchor}），
+     * 而不是"当前时刻减去学到的偏移"。这是本修复最关键的一个选择：以到达时刻为锚，
+     * 下列残差在正确实现下<b>结构上不超过 0</b>——{@code collectedAt} 不晚于发送时刻，
+     * 发送又必然发生在到达之前。剩下的只有"采集时间舍入到毫秒"这种可忽略的量。
+     * 60 秒是给对方的坏钟留的余量：偏移估计本身有网络延迟量级的误差。</p>
+     *
+     * <p><b>为什么它同时是"伪造收益"的上限</b>：年龄是从到达时刻<b>起算</b>的，
+     * 不是从包里的时间戳推算的。所以一个伪造 {@code +1 天} 的时间戳最多只能在到达的那一刻
+     * 换到一次"0 岁"，之后 30 秒（默认 3×10s）就滑向过期，与时钟准的后端完全一样。
+     * 修复前它是"永远 OK"，因为负年龄被 clamp 成 0 且再也不会前进。</p>
+     */
+    public static final long MAX_FUTURE_AHEAD_MS = 60_000L;
+
+    /**
+     * 愿意用来<b>校正</b>（而不是判为异常）的时钟偏移上限（毫秒，绝对值）。
+     *
+     * <p>取 10 分钟：</p>
+     *
+     * <ul>
+     *   <li><b>覆盖真实故障</b>：手动改过时间的机器常见偏差是几分钟；10 分钟给
+     *       "后端快 5 分钟" 这个典型场景留了一倍余量。</li>
+     *   <li><b>不给伪造留宽窗口</b>：偏移是<b>按后端</b>从 {@code sentAt - 到达时刻}
+     *       的滑动窗口学出来的，而年龄的基准是到达时刻。所以偏移只用于
+     *       "这个时间戳是不是在未来"这一项判定，不能延长任何一条数据的寿命——
+     *       把上限压到 10 分钟，同时限制了伪造者能让自己"看起来不超前"的空间。</li>
+     *   <li><b>超过 10 分钟的偏差本身就是故障</b>：那种机器上的所有年龄数字都不可信，
+     *       显示成「时钟异常」并让人去修 NTP，比"悄悄替我掰回来"更有用。</li>
+     * </ul>
+     *
+     * <p>注意越界样本<b>不参与学习</b>（见 {@link NetworkView}）：一个伪造的
+     * {@code +1 天} 样本不能把估计值拉走，它只会让该包自己落进"时间戳在未来"的判定。</p>
+     */
+    public static final long MAX_CORRECTABLE_SKEW_MS = 10L * 60_000L;
+
     private final String serverId;
     private final long sentAtMs;
     private final long collectedAtMs;
@@ -119,9 +163,91 @@ public final class SummaryPacket {
      */
     public int pushIntervalSec() { return pushIntervalSec; }
 
-    /** 快照年龄（毫秒）。负值按 0 处理——时钟不同步不该读成"未来的数据"。 */
-    public long ageMs(long nowMs) {
-        return collectedAtMs <= 0L ? Long.MAX_VALUE : Math.max(0L, nowMs - collectedAtMs);
+    /**
+     * 快照年龄（毫秒），以**包到达那一刻**为基准。
+     *
+     * <p><b>为什么基准是到达时刻，而不是"当前时刻"。</b>这是本次修复最关键的一处选择，
+     * 有两个原因：</p>
+     *
+     * <ol>
+     *   <li><b>伪造买不到寿命。</b>若以"当前时刻"为基准，一条 {@code collectedAt} 被伪造成
+     *       未来 1 天的包，在任何时刻都算出负年龄 → 被 clamp 成 0 → <b>永远</b>"正常"，
+     *       与修复前完全一样，只是换了个写法。以到达时刻为基准时，年龄从到达那一刻<b>起算</b>：
+     *       伪造最多换来刚到时的一次"0 岁"，30 秒后就过期，与诚实后端毫无区别。</li>
+     *   <li><b>跨机时钟不同步不再双向失真。</b>{@code age = (arrivedAt + skew) - collectedAt}，
+     *       其中 {@code skew} 是从 {@code sentAt - arrivedAt} 学到的偏移。诚实后端下
+     *       {@code collectedAt <= sentAt <= arrivedAt + skew}，于是年龄恰好等于
+     *       "采集→发送→到达"的真实耗时，与两台机器的钟差无关。后端快 5 分钟不再恒 OK，
+     *       慢 5 分钟也不再恒 STALE。</li>
+     * </ol>
+     *
+     * <p><b>为什么 {@code nowMs} 参数还在</b>：过期判定用的是"距最后一次到达过了多久"，
+     * 那确实是当前时刻。所以年龄本身由 {@link PacketAnchor} 提供（它记着到达时刻），
+     * 而"这条锚点过期了没有"由视图层用当前时刻判。两个量分开算，是"永不永续"与
+     * "是否已过期"不再互相污染的前提。</p>
+     *
+     * @param anchor 到达锚点（到达时刻 + 学到的偏移）；{@code null} 或未知偏移时按 0 校正
+     * @return 年龄；{@link #AHEAD_OF_NOW} = 快照时间在未来且超出容差（伪造/坏钟）；
+     *         {@link #MISSING_TIME} = 包里没有时间戳
+     */
+    public long ageMs(PacketAnchor anchor) {
+        if (collectedAtMs <= 0L) {
+            return MISSING_TIME;
+        }
+        long ahead = aheadMs(anchor);
+        if (ahead > MAX_FUTURE_AHEAD_MS) {
+            // 换算到对方时间轴上仍在未来：时间戳被伪造，或对方钟差超过我们愿意校正的范围。
+            // 两种情况都意味着"这个数的年龄不可信"，而不是"这个数很新鲜"。绝不能 clamp 成 0。
+            return AHEAD_OF_NOW;
+        }
+        // 把到达时刻搬到对方的时间轴上：对方时钟在"我们收到这一包"的那一刻读作
+        // arrivedAt + skew。
+        //
+        // 符号推导（这是本方法最容易写反的一行）：设真实时刻 T、代理偏移 p、后端偏移 b，
+        // 则样本 skew = sentAt(=T+b) - arrivedAt(=T+p) = b - p。所以对方在到达那一刻的读数
+        // 是 T+b = (arrivedAt - p) + b = arrivedAt + (b-p) = arrivedAt + skew。
+        // 于是 age = (arrivedAt + skew) - collectedAt —— 偏移恰好被抵掉。
+        return Math.max(0L, anchor.arrivedAtMs() + anchor.skewMs() - collectedAtMs);
+    }
+
+    /**
+     * 快照时间比"对方时间轴上这一包的到达时刻"超前多少毫秒（负数 = 快照在过去）。
+     *
+     * <p>判定 {@link #MAX_FUTURE_AHEAD_MS} 的原始量。单独暴露是为了让测试与视图层
+     * 能断言"超前多少"而不是只能看到被归约过的年龄。</p>
+     */
+    public long aheadMs(PacketAnchor anchor) {
+        return collectedAtMs - (anchor.arrivedAtMs() + anchor.skewMs());
+    }
+
+    /** 时间戳缺失（包里没有 {@code collectedAt}，或它是 0/负数）。 */
+    public static final long MISSING_TIME = -1L;
+    /** 快照时间在未来且超出容差——年龄不可信。 */
+    public static final long AHEAD_OF_NOW = -2L;
+
+    /**
+     * 一包到达时的锚点：本地到达时刻 + 该后端当时学到的时钟偏移。
+     *
+     * <p><b>为什么要把它单独做成一个不可变值对象，而不是在 {@code NetworkView} 里现算</b>：
+     * 年龄必须<b>冻结在到达那一刻</b>（见 {@link SummaryPacket#ageMs(PacketAnchor)} 的第 1 条
+     * 理由），而 {@code NetworkView} 里保存的偏移会随新样本继续变化。如果每次
+     * {@code snapshot()} 都用"现在的偏移"重算一个老包，那么偏移漂移会被误读成"数据变新鲜
+     * 或变陈旧"——这又是一条静默失真。锚点在 {@code onPacket} 里一次算好，之后只读。</p>
+     *
+     * @param arrivedAtMs 本地收到该包的时刻
+     * @param skewMs      当时学到的偏移（{@code sentAt - arrivedAt} 的滑动最大值；0 = 未知）
+     */
+    public static final class PacketAnchor {
+        private final long arrivedAtMs;
+        private final long skewMs;
+
+        public PacketAnchor(long arrivedAtMs, long skewMs) {
+            this.arrivedAtMs = arrivedAtMs;
+            this.skewMs = skewMs;
+        }
+
+        public long arrivedAtMs() { return arrivedAtMs; }
+        public long skewMs() { return skewMs; }
     }
 
     // ---- 解析入口 ----
@@ -200,14 +326,94 @@ public final class SummaryPacket {
 
     // ---- 防御性读取辅助 ----
 
+    /**
+     * 从 JSON 里读一个字符串，并**剔除控制字符**。
+     *
+     * <p><b>为什么必须过滤</b>：这些值最终会被拼进管理员聊天窗口的一行表格（{@code /pscope
+     * network}）。一个后端只要把 {@code server} 写成 {@code "survival\nlobby"}，面板上就会
+     * 凭空多出一行——那是纯粹的视觉伪造，管理员会把不存在的服务器当成真的。{@code \r} 同效，
+     * {@code \t} 会把列对齐全部打乱（本插件的列宽计算假设没有制表符）。
+     * BEL / ESC / NUL 之流还会在部分客户端与终端日志里触发响铃或转义序列。
+     * 实测修前 NUL、BEL、{@code \n}、{@code \t}、ESC 全部原样通过。</p>
+     *
+     * <p><b>为什么是"剔除"而不是"整包拒收"</b>：拒收会让那台后端直接隐身（与 P1-C 的
+     * 超长 id 同一个失败形态），而它的数字其实可能是好的。剔除之后 id 仍然可用、面板仍然
+     * 能显示它，只是不能再用控制字符伪造排版。失败要可见，不能变成"消失"。</p>
+     *
+     * <p><b>{@code §}（U+00A7）也剔除。</b>理由：Adventure 的 {@code Component.text()}
+     * 本身不解释它，但同一个字符串还会流进 {@code logger}、聊天回放与任何第三方
+     * legacy 序列化器——在那些地方 {@code §c} 就是一个颜色码，能让一台后端把管理员的
+     * 面板染色、把相邻列"吃掉"。合法的后端名不需要这个字符（{@code survival} /
+     * {@code skyblock-a} 这种），剔除的代价近乎为零，而保留的代价是一整类视觉伪造。
+     * 两端同口径：后端 {@code SummaryPublisher.validateServerId} 也会拒绝它，
+     * 所以正常部署永远走不到这条剔除路径——这里防的是伪造包与其它插件往同一通道塞的垃圾。</p>
+     *
+     * <p>剔除集合刻意用"白名单"而不是"黑名单"（{@code Character.isISOControl} 之外还排除
+     * 了 U+00A7）：黑名单永远漏，而 id 不需要控制字符。</p>
+     *
+     * @param o    JSON 对象
+     * @param key  字段名
+     * @param dflt 缺失 / 类型不对时的默认值
+     */
     private static String getString(JsonObject o, String key, String dflt) {
         JsonElement e = o.get(key);
         if (e == null || e.isJsonNull() || !e.isJsonPrimitive()) return dflt;
         try {
-            return e.getAsString();
+            String raw = e.getAsString();
+            return sanitize(raw);
         } catch (Exception ex) {
             return dflt;
         }
+    }
+
+    /**
+     * 剔除控制字符与 {@code §}。见 {@link #getString} 的注释。
+     *
+     * <p><b>public 是为了可测</b>：{@code parse} 是唯一入口，但直接断言它的返回值只能是
+     * "某条 JSON 解析出来是什么"；把这个判据单独暴露出来，测试才能逐字符覆盖
+     * （NUL / BEL / DEL / C1 / U+00A7 / 高位 emoji）而不必拼一堆 JSON 字符串。</p>
+     */
+    public static String sanitize(String raw) {
+        if (raw == null || raw.isEmpty()) {
+            return raw;
+        }
+        // 先扫一遍：绝大多数 id 是干净的，没有可删字符时原样返回，不产生新对象。
+        int firstBad = -1;
+        for (int i = 0; i < raw.length(); i++) {
+            if (isUnsafeChar(raw.charAt(i))) {
+                firstBad = i;
+                break;
+            }
+        }
+        if (firstBad < 0) {
+            return raw;
+        }
+        StringBuilder sb = new StringBuilder(raw.length());
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if (!isUnsafeChar(c)) {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 这个字符该不该从显示的字符串里剔除。
+     *
+     * <p>{@code Character.isISOControl} 覆盖 C0（0x00–0x1F）与 C1（0x80–0x9F），
+     * 但**不含** DEL（0x7F）与 {@code §}——两者都要单独判。</p>
+     */
+    private static boolean isUnsafeChar(char c) {
+        if (Character.isISOControl(c)) {
+            return true;
+        }
+        // DEL：ISO 控制符表里没有它，但它是 C0 之后那个"删除"控制字符，同样不可见。
+        if (c == '\u007F') {
+            return true;
+        }
+        // § (U+00A7)：legacy 格式码前缀。理由见 getString 的注释。
+        return c == '§';
     }
 
     private static long getLong(JsonObject o, String key, long dflt) {
