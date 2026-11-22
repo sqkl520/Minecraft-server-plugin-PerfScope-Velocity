@@ -60,18 +60,24 @@ public final class NetworkRenderer {
      * TPS 阈值，与后端 {@code config.yml} 的随包默认值同口径。
      *
      * <p><b>为什么必须同口径</b>：同一台后端在两个面板上被染成不同颜色是最伤信任的一种
-     * 不一致——服主会先怀疑某一个插件坏了。此前这里写 18/15 用开区间，而后端
-     * {@code ThresholdColors} 用闭区间（{@code value <= threshold}），于是恰好 15.00 与
-     * 18.00 两个点两边着色相反。后端那几个值可配置，代理侧读不到，所以这里对齐的是
+     * 不一致——服主会先怀疑某一个插件坏了。后端那几个值可配置，代理侧读不到，所以这里对齐的是
      * **随包默认值**；改了后端阈值就该同步改这里（README 有写明）。</p>
+     *
+     * <p><b>闭合性也属于"口径"的一部分，改阈值时一起看</b>：后端的判定出自
+     * {@code ThresholdOperator} 那张算子表——{@code tps} / {@code mspt} 是<b>严格</b>比较
+     * （{@code tps < 15}、{@code mspt > 50}），{@code memory} / {@code players} 才是闭区间。
+     * 代理侧自己只显示 TPS 与 MSPT 两列，所以这里必须是严格比较：<b>恰好 15.00 不报警、
+     * 14.99 才报</b>。这一版之前代理用的是闭区间（{@code <=} / {@code >=}），于是 15.00 / 18.00
+     * / 45.0 / 50.0 四个点上「代理红、后端黄」——与后端"颜色变了就等于告警已触发"的承诺相反。
+     * 判定与文案只允许有一处出处，这个面板没有第二份可以漂移的副本。</p>
      */
     public static final double TPS_WARN = 18.0;
-    /** 低于等于这个 TPS 算严重。 */
+    /** 低于这个 TPS 算严重（严格，与后端 {@code ThresholdOperator.TPS} 的 {@code <} 同口径）。 */
     public static final double TPS_CRITICAL = 15.0;
 
     /** MSPT 阈值，与后端默认值一致（45 警告 / 50 严重）。 */
     public static final double MSPT_WARN = 45.0;
-    /** 高于等于这个 MSPT 算严重。 */
+    /** 高于这个 MSPT 算严重（严格，与后端 {@code ThresholdOperator.MSPT} 的 {@code >} 同口径）。 */
     public static final double MSPT_CRITICAL = 50.0;
 
     private NetworkRenderer() {
@@ -139,15 +145,21 @@ public final class NetworkRenderer {
         }
     }
 
-    /** TPS 格：缺失写"—"，不是 0；有值时按阈值分级。 */
+    /**
+     * TPS 格：缺失写"—"，不是 0；有值时按阈值分级。
+     *
+     * <p><b>严格比较</b>（{@code <}）：恰好等于 15.00 / 18.00 不报警。与后端
+     * {@code ThresholdOperator.TPS} 逐点相同——后端那颗"颜色变了就等于告警已触发"的承诺，
+     * 在这个面板上也必须成立，否则同一份数据两处颜色不同。</p>
+     */
     static Cell tpsCell(Double tps) {
         if (tps == null) {
             return cell("—", Level.UNKNOWN);
         }
         Level level;
-        if (tps <= TPS_CRITICAL) {
+        if (tps < TPS_CRITICAL) {
             level = Level.CRITICAL;
-        } else if (tps <= TPS_WARN) {
+        } else if (tps < TPS_WARN) {
             level = Level.WARN;
         } else {
             level = Level.OK;
@@ -155,15 +167,18 @@ public final class NetworkRenderer {
         return cell(String.format(Locale.ROOT, "%.2f", tps), level);
     }
 
-    /** MSPT 格：缺失写"—"。越高越糟，闭区间（与后端 {@code ThresholdColors} 一致）。 */
+    /**
+     * MSPT 格：缺失写"—"。越高越糟，<b>严格比较</b>（{@code >}）：恰好 45.0 是 OK、
+     * 恰好 50.0 是 WARN，越过才变色。与后端 {@code ThresholdOperator.MSPT} 逐点相同。
+     */
     static Cell msptCell(Double mspt) {
         if (mspt == null) {
             return cell("—", Level.UNKNOWN);
         }
         Level level;
-        if (mspt >= MSPT_CRITICAL) {
+        if (mspt > MSPT_CRITICAL) {
             level = Level.CRITICAL;
-        } else if (mspt >= MSPT_WARN) {
+        } else if (mspt > MSPT_WARN) {
             level = Level.WARN;
         } else {
             level = Level.OK;

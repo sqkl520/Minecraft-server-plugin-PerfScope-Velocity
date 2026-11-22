@@ -21,6 +21,42 @@ PerfScope 的 Velocity 代理侧：接收各 Paper 后端上报的性能摘要�
 |---|---|---|
 | `1.4.5-SNAPSHOT-fix2` | 1 | 首个发布 |
 | `1.4.5-SNAPSHOT-fix3` | 1 | 阈值口径、过期判定、面板对齐；协议兼容 |
+| `1.4.5-SNAPSHOT-fix4` | 1 | 阈值闭合性从闭区间改回严格（跟随后端算子表）；协议兼容 |
+
+---
+
+## [1.4.5-SNAPSHOT-fix4] — 2026-11-22 — 阈值闭合性跟随后端算子表（严格比较）
+
+### Fixed — 恰好等于阈值时两个面板颜色不同
+
+fix3 把 `tpsCell` / `msptCell` 改成闭区间（`<=` / `>=`），理由是"后端 `ThresholdColors`
+用闭区间"。**那个理由在当时成立，但那份后端闭区间本身是错的**：它与后端采集层
+`ThresholdOperator`（严格比较）分裂，同一个 `tps = 15.00` 在后端界面上是红、在后端告警里只是黄，
+差一整档。后端 fix4 把展示层改成从算子表派生（`ThresholdColors` 不再自己写比较符），
+两处同时变成严格；于是代理侧这份闭区间**重新变成那个"两边着色相反"的源头**——
+恰恰是 fix3 想修的东西，方向反过来了。
+
+改回严格比较：`tps < 15.0` 才 CRITICAL、`tps < 18.0` 才 WARN、`mspt > 50.0` 才 CRITICAL、
+`mspt > 45.0` 才 WARN。于是 15.00 / 18.00 / 45.0 / 50.0 四个点上，代理与后端给出一致结论。
+
+**选代理改而不是改后端算子表**：算子表是告警行为源，把 `entities` 改成闭区间会让「恰好 30000 个实体」
+的一批服务器突然开始报 critical（`config.yml` 明写 20000/30000 是"上界留余量"取的整数），
+那是远超阈值口径修复范围的生产行为变更；代理是只读聚合面板、阈值硬编码、改动面小。
+
+### Tests
+
+`tpsTierBoundariesAreClosedLikeBackend` → `tpsTierBoundariesAreStrictLikeBackend`，
+`msptCellHandlesMissingAndTiers` 的边界期望同步（45.0 由 WARN 改 OK、50.0 由 CRITICAL 改 WARN）。
+36 个用例全过。
+
+### Changed
+
+- README「阈值口径」：闭区间 → 严格比较，并写明判据是"与后端对同一读数给同一结论"，
+  而不是"跟某个类一致"（后者正是 fix3 踩的坑：它跟的是一个后来被判为缺陷的实现）。
+
+> **留一条教训**：这次修的是"对齐了一个错误的参照物"。fix3 的对齐动作本身是对的，
+> 但当时把 `ThresholdColors` 的闭区间当成了规格，而它其实是要被修掉的那一半。
+> 现在两侧唯一可依赖的参照物是后端 `ThresholdOperator` 那张表。
 
 ---
 

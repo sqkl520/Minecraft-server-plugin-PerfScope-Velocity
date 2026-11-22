@@ -273,23 +273,35 @@ class SummaryTest {
         assertEquals(NetworkRenderer.Level.OK, NetworkRenderer.tpsCell(20.0).level());
     }
 
+    /**
+     * 阈值边界：15.00 / 18.00 两点必须与后端<b>严格比较</b>口径一致。
+     *
+     * <p><b>这条曾经断言的是相反的事。</b>fix2 把它改成闭区间，理由是"后端 ThresholdColors
+     * 用 {@code value <= threshold}"——那个理由在当时是真的，因为后端展示层确实自己写了一份
+     * 闭区间。但那份闭区间是与后端采集层（{@code ThresholdOperator}，严格比较）分裂的，
+     * 同一个 {@code tps=15.00} 在后端界面上是红的、在后端告警里只是黄。fix4 把后端展示层
+     * 改成从算子表派生，两处同时变成严格——于是这里也必须跟严格。
+     *
+     * <p>要记住的判据不是"跟某个类一致"，而是"与后端对同一读数给出同一结论"。
+     * 后端 {@code ThresholdOperator.TPS} 是 {@code tps < threshold}，所以恰好 15.00 是 WARN、
+     * 14.99 才是 CRITICAL；恰好 18.00 是 OK、17.99 才是 WARN。</p>
+     */
     @Test
-    @DisplayName("阈值边界：15.00 / 18.00 两点与后端闭区间口径一致")
-    void tpsTierBoundariesAreClosedLikeBackend() {
-        // 后端 ThresholdColors 用 value <= threshold，所以恰好等于阈值就该报警。
-        // 这里此前写成开区间（<），于是 15.00 / 18.00 两个点两边着色相反——
-        // 同一份数据在两个面板上颜色不同，是最伤信任的一种不一致。
-        assertEquals(NetworkRenderer.Level.CRITICAL, NetworkRenderer.tpsCell(15.0).level(),
-            "恰好 15.00 必须是 CRITICAL（与后端 <= 同口径）");
-        assertEquals(NetworkRenderer.Level.CRITICAL, NetworkRenderer.tpsCell(14.99).level());
+    @DisplayName("阈值边界：15.00 / 18.00 两点与后端严格比较口径一致")
+    void tpsTierBoundariesAreStrictLikeBackend() {
+        assertEquals(NetworkRenderer.Level.CRITICAL, NetworkRenderer.tpsCell(14.99).level(),
+            "低于 15.00 才是 CRITICAL");
+        assertEquals(NetworkRenderer.Level.WARN, NetworkRenderer.tpsCell(15.0).level(),
+            "恰好 15.00 是 WARN，不是 CRITICAL——后端 tps < 15 不成立，只到 warning 档");
         assertEquals(NetworkRenderer.Level.WARN, NetworkRenderer.tpsCell(15.01).level());
-        assertEquals(NetworkRenderer.Level.WARN, NetworkRenderer.tpsCell(18.0).level(),
-            "恰好 18.00 必须是 WARN");
+        assertEquals(NetworkRenderer.Level.WARN, NetworkRenderer.tpsCell(17.99).level());
+        assertEquals(NetworkRenderer.Level.OK, NetworkRenderer.tpsCell(18.0).level(),
+            "恰好 18.00 是 OK——后端 tps < 18 不成立");
         assertEquals(NetworkRenderer.Level.OK, NetworkRenderer.tpsCell(18.01).level());
     }
 
     @Test
-    @DisplayName("MSPT 分级：缺失写 —，35/45/50 三档都要判对")
+    @DisplayName("MSPT 分级：缺失写 —，45/50 两档边界是严格比较")
     void msptCellHandlesMissingAndTiers() {
         // msptCell 此前零覆盖：把只读全改成 OK 也测不出来，于是 MSPT 红色永不出现。
         assertEquals("—", NetworkRenderer.msptCell(null).text(),
@@ -298,11 +310,12 @@ class SummaryTest {
 
         assertEquals("12.3", NetworkRenderer.msptCell(12.34).text());
         assertEquals(NetworkRenderer.Level.OK, NetworkRenderer.msptCell(44.9).level());
-        assertEquals(NetworkRenderer.Level.WARN, NetworkRenderer.msptCell(45.0).level(),
-            "恰好 45.0 是警告线（与后端 >= 同口径）");
-        assertEquals(NetworkRenderer.Level.WARN, NetworkRenderer.msptCell(49.9).level());
-        assertEquals(NetworkRenderer.Level.CRITICAL, NetworkRenderer.msptCell(50.0).level(),
-            "恰好 50.0 是严重线");
+        assertEquals(NetworkRenderer.Level.OK, NetworkRenderer.msptCell(45.0).level(),
+            "恰好 45.0 是 OK——后端 mspt > 45 不成立");
+        assertEquals(NetworkRenderer.Level.WARN, NetworkRenderer.msptCell(45.1).level());
+        assertEquals(NetworkRenderer.Level.WARN, NetworkRenderer.msptCell(50.0).level(),
+            "恰好 50.0 是 WARN——后端 mspt > 50 不成立");
+        assertEquals(NetworkRenderer.Level.CRITICAL, NetworkRenderer.msptCell(50.1).level());
         assertEquals(NetworkRenderer.Level.CRITICAL, NetworkRenderer.msptCell(120.0).level());
     }
 
