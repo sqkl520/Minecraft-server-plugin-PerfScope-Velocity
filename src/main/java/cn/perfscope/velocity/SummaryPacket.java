@@ -186,13 +186,21 @@ public final class SummaryPacket {
      * 而"这条锚点过期了没有"由视图层用当前时刻判。两个量分开算，是"永不永续"与
      * "是否已过期"不再互相污染的前提。</p>
      *
-     * @param anchor 到达锚点（到达时刻 + 学到的偏移）；{@code null} 或未知偏移时按 0 校正
+     * @param anchor 到达锚点（到达时刻 + 学到的偏移）；{@code null} 按"刚到达、无偏移"处理
+     *               （见下方说明）
      * @return 年龄；{@link #AHEAD_OF_NOW} = 快照时间在未来且超出容差（伪造/坏钟）；
      *         {@link #MISSING_TIME} = 包里没有时间戳
      */
     public long ageMs(PacketAnchor anchor) {
         if (collectedAtMs <= 0L) {
             return MISSING_TIME;
+        }
+        if (anchor == null) {
+            // 没有锚点算不出年龄。这里按"刚到、无偏移"处理（年龄 0），
+            // 与 {@link NetworkView#snapshot} 里"锚点缺失时按刚到处理，宁可乐观也不要 NPE"
+            // 的降级方向一致：一个缺失的锚点不该让整张面板崩掉。
+            // 这条路径生产代码走不到（见 {@link #aheadMs(PacketAnchor)} 的说明）。
+            return 0L;
         }
         long ahead = aheadMs(anchor);
         if (ahead > MAX_FUTURE_AHEAD_MS) {
@@ -215,8 +223,28 @@ public final class SummaryPacket {
      *
      * <p>判定 {@link #MAX_FUTURE_AHEAD_MS} 的原始量。单独暴露是为了让测试与视图层
      * 能断言"超前多少"而不是只能看到被归约过的年龄。</p>
+     *
+     * <p><b>{@code anchor == null} 的处理</b>：javadoc 以前写"null 按 0 校正"，实现却直接
+     * {@code anchor.arrivedAtMs()} → NPE。两者必须对齐，而<b>对齐到哪一边是有讲究的</b>：</p>
+     *
+     * <ul>
+     *   <li>抛 NPE 会让整个面板崩掉——一个缺失的锚点不该有这个后果（{@link NetworkView#snapshot}
+     *       本来就有"锚点缺失时降级"的分支，它需要一个能用的返回值）。</li>
+     *   <li>把 null 当成"到达时刻 = 0、偏移 = 0"是错的：那会让年龄算成
+     *       {@code 0 - collectedAt}，一个巨大的负数（→ 判 MISSING_TIME 之外的东西），
+     *       荒谬程度不亚于 NPE。</li>
+     *   <li>这里选择<b>加 null 守卫、返回"零超前"</b>：没有锚点就没有证据说时间戳在未来，
+     *       于是按"不超前"处理（等价于"这一包刚到达、两端同钟"）。这是三条里最保守的
+     *       ——它不会凭空判人不可信，也不会崩。</li>
+     * </ul>
+     *
+     * <p>注意生产路径走不到 null：{@code NetworkView} 在 {@code onPacket} 里成对写入 packet
+     * 与 anchor，{@code snapshot} 取不到 anchor 时自己造一个。这个守卫只保护外来调用方。</p>
      */
     public long aheadMs(PacketAnchor anchor) {
+        if (anchor == null) {
+            return 0L;
+        }
         return collectedAtMs - (anchor.arrivedAtMs() + anchor.skewMs());
     }
 
@@ -345,8 +373,13 @@ public final class SummaryPacket {
      * legacy 序列化器——在那些地方 {@code §c} 就是一个颜色码，能让一台后端把管理员的
      * 面板染色、把相邻列"吃掉"。合法的后端名不需要这个字符（{@code survival} /
      * {@code skyblock-a} 这种），剔除的代价近乎为零，而保留的代价是一整类视觉伪造。
-     * 两端同口径：后端 {@code SummaryPublisher.validateServerId} 也会拒绝它，
-     * 所以正常部署永远走不到这条剔除路径——这里防的是伪造包与其它插件往同一通道塞的垃圾。</p>
+     * <b>两端同口径</b>：后端 {@code SummaryPublisher.validateServerId} 用<b>同一条判据</b>
+     * （{@code isISOControl} + DEL + {@code §}）但它选择<b>拒发</b>而不是剔除——
+     * 因为对后端来说这是"服主配错了"，可以修，而且必须说清是哪个码点；
+     * 而对代理来说这多半是"外来包"，没得修，只能剔除后继续用（整包拒收会让那台后端隐身）。</p>
+     *
+     * <p><b>这里防的是谁</b>：正常部署走不到这条剔除路径（发送端已经拒发了）。
+     * 它防的是伪造包、被入侵的后端、以及别的插件往同一通道塞进来的垃圾。</p>
      *
      * <p>剔除集合刻意用"白名单"而不是"黑名单"（{@code Character.isISOControl} 之外还排除
      * 了 U+00A7）：黑名单永远漏，而 id 不需要控制字符。</p>

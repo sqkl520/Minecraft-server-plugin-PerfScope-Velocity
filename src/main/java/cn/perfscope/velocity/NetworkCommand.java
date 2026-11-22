@@ -84,18 +84,22 @@ public final class NetworkCommand implements SimpleCommand {
         // 按各列最大宽度填充后再拼：否则中文状态（4 字）与数字（1-2 格）会让每一行的
         // 第 3 列起落在不同位置，六行以上看不出哪台不对劲——而横向比较正是这个
         // 面板存在的理由。填充在命令层做，因为只有这里知道要拼成一行。
-        int[] widths = NetworkRenderer.columnWidths(rows, NetworkRenderer.HEADERS);
+        //
+        // 布局对象同时带回"每格已经量过的宽度"：填充时不再对每格重新量一遍。
+        // 以前这里是 int[]，于是每格宽度在"算列宽"和"补空格"两处各量一次，
+        // 全表 1542 格就是 1536 次白扫（详见 NetworkRenderer.ColumnLayout 的说明）。
+        NetworkRenderer.ColumnLayout layout = NetworkRenderer.columnWidths(rows, NetworkRenderer.HEADERS);
         StringBuilder header = new StringBuilder();
         for (int i = 0; i < NetworkRenderer.HEADERS.length; i++) {
             if (i > 0) header.append("  ");
             String h = NetworkRenderer.HEADERS[i];
             header.append(i == NetworkRenderer.HEADERS.length - 1
-                ? h : NetworkRenderer.padTo(h, widths[i]));
+                ? h : NetworkRenderer.padTo(h, layout.column(i)));
         }
         src.sendMessage(Component.text(header.toString(), NamedTextColor.WHITE));
 
-        for (NetworkRenderer.Row row : rows) {
-            src.sendMessage(renderRow(row, widths));
+        for (int r = 0; r < rows.size(); r++) {
+            src.sendMessage(renderRow(rows.get(r), layout, r));
         }
     }
 
@@ -121,8 +125,9 @@ public final class NetworkCommand implements SimpleCommand {
         }
     }
 
-    /** 把一行的各格拼成一个 Component，逐格上色，按 {@code widths} 补齐列宽。 */
-    private static Component renderRow(NetworkRenderer.Row row, int[] widths) {
+    /** 把一行的各格拼成一个 Component，逐格上色，按 {@code layout} 的列宽补齐。 */
+    private static Component renderRow(NetworkRenderer.Row row, NetworkRenderer.ColumnLayout layout,
+                                       int rowIndex) {
         Component out = Component.empty();
         List<NetworkRenderer.Cell> cells = row.cells();
         for (int i = 0; i < cells.size(); i++) {
@@ -131,9 +136,11 @@ public final class NetworkCommand implements SimpleCommand {
                 out = out.append(Component.text("  ", NamedTextColor.DARK_GRAY));
             }
             // 最后一列不补：行尾空格在聊天框里看不见，只是白白多几个字符。
+            // 其余列走 layout.render()——宽度来自 columnWidths 已经量过的那一遍，
+            // 不再对同一格做第二次字素簇扫描。
             String text = i == cells.size() - 1
                 ? cell.text()
-                : NetworkRenderer.padTo(cell.text(), widths[i]);
+                : layout.render(rowIndex, i, cell.text());
             out = out.append(Component.text(text, colorOf(cell.level())));
         }
         return out;

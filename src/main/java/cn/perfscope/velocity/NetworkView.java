@@ -92,12 +92,26 @@ public final class NetworkView {
         /**
          * 校正后仍在未来：时钟不同步到不可校正的程度，或者时间戳是伪造的。
          *
-         * <p>刻意只有这一种。**"时间戳缺失"不是时钟问题**：那种包连"后端说是几点"都没有，
+         * <p>**"时间戳缺失"不是时钟问题**：那种包连"后端说是几点"都没有，
          * 归进「时钟异常」会让服主去查 NTP，方向是错的。缺失包仍按旧路径处理
          * （年龄不可知 → 判为 {@link State#STALE}，文案「数据过期」），
          * 因为对使用者来说结论一样是"这行数字不保证是现状"。</p>
          */
-        FUTURE
+        FUTURE,
+        /**
+         * 校正后仍在**过去**到荒谬的程度（超过 {@link #MAX_PLAUSIBLE_AGE_MS}）：
+         * 这个时间戳不是一次真实的采集时刻。
+         *
+         * <p><b>为什么必须与 FUTURE 分开、又必须也判 CLOCK_SKEW</b>：修复前只有"太新"这一侧
+         * 有闸门，于是 {@code collectedAt=1969} 的包算出一个巨大的正年龄，状态仍是 OK、
+         * 照常参与全网聚合，面板上给出<b>绿色的 20.00</b> 和「498888小时前」。
+         * 结论是错的，而且是往"健康"那一侧错。</p>
+         *
+         * <p>判成 {@link State#STALE} 也能挡住绿色，但文案会写「可能空服」——
+         * 没有任何空服会产出 1969 年的时间戳，那是把"时钟/伪造"说成了"没人玩"，
+         * 方向同样是错的。所以走 CLOCK_SKEW，让人去查那台机器的时钟。</p>
+         */
+        PAST
     }
 
     /** 单个后端在某一时刻的视图。 */
@@ -106,15 +120,17 @@ public final class NetworkView {
         private final State state;
         private final SummaryPacket packet;
         private final long ageMs;
+        private final long silentMs;
         private final ClockIssue clockIssue;
         private final long aheadMs;
 
-        Node(String serverId, State state, SummaryPacket packet, long ageMs,
+        Node(String serverId, State state, SummaryPacket packet, long ageMs, long silentMs,
              ClockIssue clockIssue, long aheadMs) {
             this.serverId = serverId;
             this.state = state;
             this.packet = packet;
             this.ageMs = ageMs;
+            this.silentMs = silentMs;
             this.clockIssue = clockIssue;
             this.aheadMs = aheadMs;
         }
@@ -123,8 +139,64 @@ public final class NetworkView {
         public State state() { return state; }
         /** 原始包；{@link State#NO_DATA} 时为 {@code null}。 */
         public SummaryPacket packet() { return packet; }
-        /** 快照年龄；不可判定时（{@link State#NO_DATA} / {@link State#CLOCK_SKEW}）为 {@link Long#MAX_VALUE}。 */
+
+        /**
+         * **锚定的**数据年龄：这一包在到达的那一刻，它自己有多旧（采集 → 发送 → 到达的耗时）。
+         *
+         * <p><b>它不是"这块数据现在多旧"，而且它不会随时间增长</b>——锚点在
+         * {@code onPacket} 里按到达时刻冻结（见 {@link SummaryPacket.PacketAnchor}），
+         * 因为让年龄"随现在时刻前进"正是 P1-V 要堵的形状（伪造未来时间戳能换来永久 0 岁）。
+         * 代价是：一台一小时没上报的后端，这个数仍停在它刚到时的 0.3 秒。</p>
+         *
+         * <p>所以要显示"多久没数据"必须用 {@link #dataAgeMs()} 而不是它。
+         * 这个访问器保留原义，给"测量延迟本身"这件事用（例如诊断链路是否很慢）。
+         * 不可判定时（{@link State#NO_DATA} / {@link State#CLOCK_SKEW}）为 {@link Long#MAX_VALUE}。</p>
+         */
         public long ageMs() { return ageMs; }
+
+        /**
+         * 距最后一次收到这一包的时长（毫秒）——"这个后端还在说话吗"。
+         *
+         * <p>STALE / COLLECTOR_DEAD 的判据用的就是它，显示层也应该用它：
+         * 一台静默 60 分钟的后端，锚定年龄恒为 0.3 秒，直接显示出来就是
+         * 「0秒前」——把"一小时没有数据"写成"刚刚才采的"。</p>
+         */
+        public long silentMs() { return silentMs; }
+
+        /**
+         * **这块数据现在有多旧** = 静默时长 + 锚定年龄。
+         *
+         * <p>推导：数据在 {@code collectedAt} 被采集，在 {@code arrivedAt} 到达（那时它已经
+         * {@code ageMs} 旧了），此后又静默了 {@code silentMs}。所以"现在"距采集时刻
+         * 恰好是两者之和。它是**唯一**一个对三种情形都成立的单一数字：</p>
+         *
+         * <ul>
+         *   <li>正常上报：静默 ≈ 0～3×间隔，年龄 ≈ 采集延迟，合计 ≈ 数据真实年龄（几十毫秒到几十秒）。</li>
+         *   <li>后端停摆一小时：静默 3600 秒 + 年龄 0.3 秒 → 「1小时前」。这正是要修的那条。</li>
+         *   <li>采集器死了但包还在到（{@code collectedAt} 冻结、{@code arrivedAt} 前进）：
+         *       年龄自己在长，静默 ≈ 0，合计仍然正确。</li>
+         * </ul>
+         *
+         * <p>只显示 {@code ageMs} 会在前两种情形说谎（恒 0）；只显示 {@code silentMs}
+         * 会在第三种说谎（恒 0）。相加是唯一不需要按状态分支、也不说谎的口径。</p>
+         *
+         * <p>时间戳不可信时为 {@link Long#MAX_VALUE}（渲染成「—」），
+         * {@link State#NO_DATA} 时同理。</p>
+         */
+        public long dataAgeMs() {
+            if (ageMs == Long.MAX_VALUE) {
+                return Long.MAX_VALUE;
+            }
+            // 锚定年龄可能是负数哨兵（缺失 / 未来）——那时"数据多旧"无从计算，
+            // 不能拿哨兵值参与相加，否则 -1 会让显示年轻一毫秒（数值错得很轻微，
+            // 但错就是错）。这部分按 0 计，静默时长仍然是可信的下界。
+            long anchored = ageMs > 0L ? ageMs : 0L;
+            long sum = silentMs + anchored;
+            // 静默时长与年龄都来自 long，极端输入下可能溢出成负数。夹回 MAX 表示"算不出来"，
+            // 而不是让一个负年龄渲染成"0秒前"——那正是本类要防的那句话。
+            return sum < 0L ? Long.MAX_VALUE : sum;
+        }
+
         /** 时间戳的问题（{@link State#CLOCK_SKEW} 之外的节点恒为 {@link ClockIssue#NONE}）。 */
         public ClockIssue clockIssue() { return clockIssue; }
         /**
@@ -348,6 +420,18 @@ public final class NetworkView {
     }
 
     /**
+     * 当前锚点表的条数（给测试与诊断用）。
+     *
+     * <p><b>为什么要暴露这个数字</b>：`anchors` 是与 `latest` 成对写入的第二张表，
+     * "两张表必须同生同灭"是一条<b>结构性质</b>，但没有任何生产路径会读它的大小——
+     * 于是漏清（本次实测的那条 bug）在行为上完全不可见：面板照常工作，只是表在长。
+     * 只有把大小暴露出来，测试才能钉住"clear 之后两张表都为空"。</p>
+     */
+    public int anchorCount() {
+        return anchors.size();
+    }
+
+    /**
      * 计算当前视图。
      *
      * @param nowMs            当前时间（用来判"最后一次到达已经过去多久"）
@@ -381,7 +465,8 @@ public final class NetworkView {
         for (String id : ids) {
             SummaryPacket p = copy.get(id);
             if (p == null) {
-                out.add(new Node(id, State.NO_DATA, null, Long.MAX_VALUE,
+                // NO_DATA：连"静默多久"都无从谈起（从没到过），两个年龄都给 MAX（渲染成 —）。
+                out.add(new Node(id, State.NO_DATA, null, Long.MAX_VALUE, Long.MAX_VALUE,
                     ClockIssue.NONE, 0L));
                 continue;
             }
@@ -398,16 +483,27 @@ public final class NetworkView {
             long staleMs = p.pushIntervalSec() > 0
                 ? p.pushIntervalSec() * 1000L * STALE_MULTIPLIER
                 : fallbackStaleMs;
-            // ⚠️ 过期判据是"**距离最后一次到达**过了多久"，不是包里的年龄。
+            // ⚠️ 过期判据是"**这块数据现在多旧**"，不是"最后一次到达过了多久"，也不是包里的年龄。
             //
-            // 这两个量必须分开，正是本次修复的核心：
-            //   - 包里的年龄（collectedAt 距发送有多久）回答"这条读数采于多久以前"，
-            //     它锚定在到达时刻，因此伪造时间戳最多换来刚到时的一次 0 岁，
-            //     之后不会再前进，也就骗不到"永续正常"。
-            //   - 距最后一次到达的时长回答"这个后端还在说话吗"，它才该决定 OK / STALE。
-            // 旧实现把两者混成一个 clamp 过的数，于是任何一个方向的时间戳异常
+            // 三个量必须分开，正是本次修复的核心：
+            //   - 锚定年龄 age（collectedAt 距到达时刻有多久）回答"这条读数采于多久以前"。
+            //     它锚定在到达时刻，所以伪造时间戳最多换来刚到时的一次 0 岁，之后不再前进，
+            //     也就骗不到"永续正常"。**但它不随时间增长**，不能单独用来判过期。
+            //   - 距最后一次到达的时长 silentMs 回答"这个后端还在说话吗"。
+            //     它随时间增长，但看不见"包到的时候就已经很旧"这种情形。
+            //   - dataAge = silentMs + age 才是"这块数据现在多旧"，两者都覆盖。
+            //
+            // 旧实现把三者混成一个 clamp 过的数，于是任何一个方向的时间戳异常
             // 都能让后者永远算成 0。
+            //
+            // 为什么用 dataAge 而不是只用 silentMs：一个 collectedAt 比现在早 10 年、
+            // 但刚刚到达的包，silentMs ≈ 0 —— 只看它就会判 OK 并给它绿色，而那块数据
+            // 明明已经十年没更新了。dataAge 把这一段也算进去，且**不会削弱 P1-V**：
+            // 伪造未来时间戳时 age 被夹到 0，dataAge 退化成 silentMs，与修复后的行为一致。
             long silentMs = Math.max(0L, nowMs - anchor.arrivedAtMs());
+            // 负数（缺失 / 未来）不参与相加：那些情形由下面的分支单独定性。
+            long anchoredForAge = age > 0L ? age : 0L;
+            long dataAgeForGate = silentMs + anchoredForAge;
             // 顺序是**判定语义**，不是随便排的：
             //   1. 时间戳在未来 —— 优先于一切。旧实现把负年龄 clamp 成 0，
             //      于是一个 2100 年的时间戳 = 年龄恒 0 = 状态恒 OK，一台死掉的后端
@@ -434,28 +530,46 @@ public final class NetworkView {
                 issue = ClockIssue.FUTURE;
                 shownAhead = ahead;
             } else if (!p.collectorAlive()) {
+                // COLLECTOR_DEAD 先于"太旧"判：包还是新鲜的，只是后端自己说采集器死了。
+                // 这个结论比"时间戳可疑"更具体、更可行动，不该被后者抢走。
                 s = State.COLLECTOR_DEAD;
-            } else if (silentMs > staleMs) {
+            } else if (age > MAX_PLAUSIBLE_AGE_MS) {
+                // 太旧：超过了"这还可能是一次真实采集"的下限合理性（见 MAX_PLAUSIBLE_AGE_MS）。
+                //
+                // 修复前只有"太新"这一侧有闸门：collectedAt=1969 的包算出一个巨大的正年龄，
+                // 状态照常 OK、参与全网平均，面板上给出**绿色的 20.00** 和「498888小时前」。
+                // 那个数字来自一条根本不是测量的时间戳，却因为"是正数"被一路信任。
+                //
+                // 判 CLOCK_SKEW 而不是 STALE，是因为文案要说准：没有任何空服会产出 1969 年的
+                // 时间戳，写成「可能空服」等于把人指向"没人玩"，而真正该看的是那台机器的时钟。
+                s = State.CLOCK_SKEW;
+                issue = ClockIssue.PAST;
+            } else if (dataAgeForGate > staleMs) {
                 s = State.STALE;
             } else {
                 s = State.OK;
             }
-            // 时间戳不可信时年龄本身没有意义：给 Long.MAX_VALUE，渲染层会写成 —，
-            // 而不是显示一个看起来精确的"0 秒前"。
+            // 年龄格显示什么，与"用什么判过期"是两个问题——修 P1-V 时把它们混在一起过。
             //
-            // 另一个特例：拿不到时间戳的包（旧版/外来包）。它的沉默时长是可信的，
-            // 但它自报的 age 是"很久以前"（collectedAt=0），照原样显示会出现
-            // "490000小时前"这种荒谬数字。沉默时长不超过阈值本身才是关键结论，
-            // 所以这里报一个"至少这么久"的保守值 —— 不伪造精确度。
-            long shownAge;
+            // 历史教训（本批的回归）：判定已经改用 silentMs，显示却还在用 age。age 锚定在
+            // 到达时刻，所以**几乎恒为 0**：静默 31 秒 / 120 秒 / 3600 秒的后端，行上全写
+            // 「0秒前（可能空服）」，采集器死一小时后写「0秒前（数字已冻结）」——
+            // 正是"把已经一小时没数据写成 0 秒前"这类谎报，而且出现在最需要看年龄的两行。
+            //
+            // 现在：渲染层用 {@link Node#dataAgeMs()} = 静默时长 + 锚定年龄，三种状态都对。
+            // 这里仍把两个分量分开存，渲染层才能按状态挑选措辞（例如 OK 行只写数据年龄）。
+            long shownAge = age;
             if (s == State.CLOCK_SKEW) {
+                // 时间戳不可信时年龄本身没有意义：给 MAX，渲染层写 —，
+                // 绝不显示一个看起来精确的"0 秒前"（那正是伪造者想换来的那句话）。
                 shownAge = Long.MAX_VALUE;
             } else if (p.collectedAtMs() <= 0L) {
-                shownAge = silentMs;
-            } else {
-                shownAge = age;
+                // 拿不到时间戳的包（旧版/外来包）。它的静默时长是可信的，但它自报的
+                // collectedAt=0 会让年龄算成"很久以前"。锚定年龄部分按"不可知"处理
+                // （dataAgeMs 会把它当 0），于是显示的就是静默时长这个可信下界。
+                shownAge = SummaryPacket.MISSING_TIME;
             }
-            out.add(new Node(id, s, p, shownAge, issue, shownAhead));
+            out.add(new Node(id, s, p, shownAge, silentMs, issue, shownAhead));
         }
 
         out.sort(Comparator.comparing(Node::serverId));
@@ -586,6 +700,33 @@ public final class NetworkView {
         return n;
     }
 
+    /**
+     * 一条读数"还可能是一次真实采集"的年龄上限（毫秒）。
+     *
+     * <p><b>为什么需要这条下限闸门</b>：P1-V 只补了"太新"那一侧（{@link SummaryPacket#MAX_FUTURE_AHEAD_MS}），
+     * 于是 {@code collectedAt=1969} 这类值算出一个巨大的<b>正</b>年龄，一路通过所有判据：
+     * 状态 OK、参与全网平均、面板上给出绿色的 20.00，年龄格写「498888小时前」。
+     * 一个明显不是测量的时间戳，只因为"结果是正数"就被当成事实。</p>
+     *
+     * <p><b>为什么取 10 年</b>：
+     * <ul>
+     *   <li>它必须大到不影响任何真实部署：一台正常上报的后端，年龄是<b>毫秒到秒</b>级；
+     *       就算后端整机宕机一年再恢复，它的第一包也只会有"一年"的年龄（且那时早就 STALE 了，
+     *       不会走到这条判据之外的路径）。10 年留了十倍余量，不存在误伤。</li>
+     *   <li>它必须小到能挡住"纪元零点"这类值：{@code collectedAt=0} 由
+     *       {@link SummaryPacket#MISSING_TIME} 那条分支单独处理；而 1969 / 1970 /
+     *       1970 之前任何值都会落在 10 年之外。</li>
+     *   <li>10 年是<b>可解释</b>的：它对应"这个插件不可能有这么老的运行数据"
+     *       （PerfScope 自身的版本历史还不到一年）。用一个"宇宙尺度"的数字（比如 100 年）
+     *       会让人以为判据是随便取的；用"一天"又会误伤"后端宕机一周后重启、
+     *       代理缓存里还留着老包"这种真实但少见的形态。</li>
+     * </ul></p>
+     *
+     * <p>超限判 {@link State#CLOCK_SKEW}（{@link ClockIssue#PAST}）而不是 STALE：
+     * 见 {@link ClockIssue#PAST} 的说明——STALE 的文案「可能空服」会把方向指错。</p>
+     */
+    public static final long MAX_PLAUSIBLE_AGE_MS = 10L * 365L * 24L * 60L * 60L * 1000L;
+
     /** 清空。给"重新开始统计"用；调用点见 {@code NetworkCommand} 的 {@code reset} 子命令。 */
     public void clear() {
         synchronized (latest) {
@@ -593,6 +734,14 @@ public final class NetworkView {
             // 偏移样本一起清：reset 的语义是"从头开始"，留着旧偏移会让下一包立刻
             // 带着上一轮的估计值，且被 reset 的 id 从此在偏移表里永久驻留。
             skewSamples.clear();
+            // ⚠️ 锚点也必须清。这一条是实测漏掉的：正常路径下 anchors 跟着 latest 的
+            // LRU 淘汰一起删（见 onPacket），但 clear() 走的是另一条路径，两个兄弟表清了、
+            // 它没清。于是每次 reset 留下当轮全部 id 的锚点，实测 10 次 reset 后
+            // 表里常驻 2560 条——一张网络输入驱动、只会增长的表。
+            //
+            // 后果不只是内存：残留的锚点会让"重新开始统计"后的第一包沿用旧到达时刻，
+            // 静默时长算出一个远大于真实值的数，刚 reset 完就显示「数据过期」。
+            anchors.clear();
         }
     }
 }
