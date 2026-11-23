@@ -311,46 +311,44 @@ class NetworkCommandTest {
     }
 
     /**
-     * <b>已知缺口（记录当前行为，不是认可它）</b>：某一个后端 {@code getServerInfo()} 返回
-     * {@code null} 时，<b>整张列表</b>都会降级成空——不是只跳过那一台。
+     * 某一台后端 {@code getServerInfo()} 返回 {@code null} 时，<b>只有那一台</b>被跳过，
+     * 其余后端照常列出。
      *
-     * <p>原因在 {@code expectedServers()}：整段循环包在同一个 {@code try/catch(Exception)} 里，
-     * 一台坏后端抛出的 NPE 会让整个方法走 catch 分支返回 {@code emptyList()}，
-     * 于是<b>本来正常的那几台也一起从面板上消失</b>。症状是"面板上所有后端都显示无数据"，
-     * 与"插件没装好"一模一样，而真实原因只是其中一台第三方插件的注册信息不完整。</p>
+     * <p>这条曾经是「记录现状」的哨兵，钉住的是一个真缺口：{@code expectedServers()} 把整段
+     * 循环包在同一个 {@code try/catch(Exception)} 里，一台坏后端抛出的 NPE 会让整个方法走
+     * catch 分支返回 {@code emptyList()}，于是<b>本来正常的那几台也一起从面板上消失</b>。
+     * 症状是"面板上所有后端都显示无数据"，与"插件没装好"逐字相同，而真实原因只是其中一台
+     * 第三方插件的注册信息不完整。</p>
      *
-     * <p>本用例固定的是<b>现状</b>，好让将来有人修（把 try 移进循环内部）时立刻看到行为变了。
-     * 它之所以写成断言而不是注释：这类"降级范围过大"的行为一旦被无意改掉，
-     * 没有测试会告诉你；而一旦被有意修好，这条会红并且提示去更新它。</p>
-     *
-     * <p>注意：这属于"不修改生产判定逻辑"的边界内——本 Agent 只补测试，不改
-     * {@code expectedServers}。缺口本身记在汇报里。</p>
+     * <p>缺口已修：降级粒度改成单台。本用例随之从"钉住整表降级"翻转成"钉住逐台跳过"——
+     * 若有人把 try 又挪回循环外面，正常那台会一起消失，这条会立刻红。</p>
      */
     @Test
-    @DisplayName("已知缺口：一台后端 getServerInfo()=null 会让整张列表降级为空")
-    void nullServerInfoDegradesWholeList_DocumentedCurrentBehavior() {
+    @DisplayName("一台后端 getServerInfo()=null 只跳过它自己，不牵连其余后端")
+    void nullServerInfoSkipsOnlyThatServer() {
         List<RegisteredServer> servers = new ArrayList<>();
         servers.add(VelocityStubs.stub(RegisteredServer.class,
             VelocityStubs.on("getServerInfo", a -> null)));
         servers.add(registeredServer("survival", 25567));
+        servers.add(registeredServer("creative", 25568));
 
         PerfScopeVelocity plugin = plugin(proxyServer(servers));
         NetworkCommand cmd = new NetworkCommand(plugin);
-
-        // 先塞一条，证明"降级成空列表"之后仍然能显示收到过包的（不会整块空白）。
-        plugin.view().onPacket(SummaryPacket.parse((
-            "{\"v\":1,\"kind\":\"summary\",\"server\":\"survival\",\"sentAt\":2200,"
-                + "\"collectedAt\":2100,\"alive\":true,\"players\":3,\"tps1m\":20.0}")
-                .getBytes(java.nio.charset.StandardCharsets.UTF_8)), 2200L);
 
         VelocityStubs.Inbox inbox = new VelocityStubs.Inbox();
         cmd.execute(invocation(source(inbox, true), "network"));
 
         String all = inbox.joined();
         assertTrue(all.contains("survival"),
-            "即便 registered 列表整体降级，收到过包的后端仍必须出现在面板上：" + all);
+            "坏的那台不该把正常的那台一起抹掉：" + all);
+        assertTrue(all.contains("creative"),
+            "坏的那台不该把正常的那台一起抹掉：" + all);
+        assertTrue(all.contains("无数据"),
+            "跳过一台之后，其余没上报的后端仍必须显示「无数据」：" + all);
+        assertFalse(all.contains("null "),
+            "坏后端的名字绝不能渲染成字面量 null：" + all);
         assertTrue(all.contains("后端 "),
-            "汇总行仍应渲染出来（降级不该导致命令什么都不输出）：" + all);
+            "汇总行仍应渲染出来：" + all);
     }
 
     /**

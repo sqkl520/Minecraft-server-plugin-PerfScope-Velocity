@@ -3,6 +3,7 @@ package cn.perfscope.velocity;
 import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.proxy.Player;
+import com.velocitypowered.api.proxy.server.RegisteredServer;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 
@@ -108,21 +109,35 @@ public final class NetworkCommand implements SimpleCommand {
      *
      * <p>取自 Velocity 自己配置里已注册的后端——这样"某一台从来没上报过"也能显示出来，
      * 而不是从面板上彻底消失。只看"收到过包的"会漏掉最重要的一种情况：某台后端压根没配好。</p>
+     *
+     * <p><b>降级粒度是"单个后端"，不是"整张表"</b>。这里以前把整段循环包在一个
+     * {@code try/catch(Exception)} 里，于是某一台后端的 {@code getServerInfo()} 返回 null
+     * （第三方插件注册信息不完整时会发生）抛出的 NPE 会让方法直接走 catch，
+     * 把<b>本来正常的那几台也一起</b>从面板上抹掉。症状是"所有后端都显示无数据"，
+     * 与"插件没装好"逐字相同，而真实原因只是其中一台的注册信息有缺陷——排查方向被指错了。
+     * 现在每台各自兜底：坏的那台跳过，其余照常列出。</p>
      */
     private java.util.Collection<String> expectedServers() {
+        java.util.Collection<RegisteredServer> registered;
         try {
-            List<String> ids = new ArrayList<>();
-            for (var registered : plugin.server().getAllServers()) {
-                String name = registered.getServerInfo().getName();
+            registered = plugin.server().getAllServers();
+        } catch (Exception e) {
+            // 整个注册表都读不出来（velocity.toml 读不出来）只能整体降级成"只显示收到过包的"：
+            // 少看到"哪台没上报"是可接受的，命令崩掉不是。
+            return java.util.Collections.emptyList();
+        }
+        List<String> ids = new ArrayList<>();
+        for (var server : registered) {
+            try {
+                String name = server.getServerInfo().getName();
                 if (name != null && !name.isBlank()) {
                     ids.add(name);
                 }
+            } catch (Exception e) {
+                // 单台注册信息有缺陷时只跳过它，不能让一台坏数据把整张表清空。
             }
-            return ids;
-        } catch (Exception e) {
-            // 取不到就退回"只显示收到过包的"，仍然可用，只是看不出哪台没上报。
-            return java.util.Collections.emptyList();
         }
+        return ids;
     }
 
     /** 把一行的各格拼成一个 Component，逐格上色，按 {@code layout} 的列宽补齐。 */
