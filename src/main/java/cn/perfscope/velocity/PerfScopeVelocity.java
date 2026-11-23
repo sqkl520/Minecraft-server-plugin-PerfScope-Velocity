@@ -236,8 +236,45 @@ public final class PerfScopeVelocity {
     /** 来源绑定器。持有"哪个 server-id 已经钉在哪条后端上"的记忆。 */
     private final SourceBinder sourceBinder = new SourceBinder();
 
-    /** 已就该 (server-id → 后端名) 组合报过警的，避免每分钟重复。key 见 {@link #mismatchKey}。 */
-    private final Map<String, Boolean> mismatchWarned = new HashMap<>();
+    /**
+     * 已就该 (server-id → 后端名) 组合报过警的，避免同一对组合每分钟重复。
+     *
+     * <p>key 见 {@link #mismatchKey}。表有界（{@link #MISMATCH_WARNED_MAX}），
+     * 且**按最近使用顺序淘汰**而不是整体清空——与 {@link SourceBinder} 的理由相同：
+     * 清表会让持续不断的攻击者每次都重新拿到一轮"首次告警"，等于没有限频。</p>
+     */
+    private final Map<String, Boolean> mismatchWarned =
+        new java.util.LinkedHashMap<>(16, 0.75f, /* accessOrder */ true);
+
+    /**
+     * {@link #mismatchWarned} 的上限。
+     *
+     * <p>比 {@link SourceBinder#BINDINGS_MAX} 小得多，因为一条告警的价值远低于一条绑定：
+     * 真实的"名字不一致"部署最多几十台，512 已经是量级上的余量；再大只是在允许
+     * 攻击者用更多内存换同样的日志噪音。</p>
+     */
+    static final int MISMATCH_WARNED_MAX = 256;
+
+    /**
+     * 全部来源不一致告警的**全局限频**窗口（毫秒）。
+     *
+     * <p><b>为什么 "每对组合只报一次" 还不够</b>：一台后端每包换一个新 id，
+     * 就得到一个新的 (id, 后端名) 组合，于是"每对只报一次"退化成"每包报一次"——
+     * 实测 1000 个 id → 1000 条 WARN。按 id 去重的任何方案都有这个形状，
+     * 因为 id 本身就是攻击者可控的量。</p>
+     *
+     * <p>所以必须再加一道<b>与内容无关</b>的闸门：无论来了多少种新组合，全局每
+     * {@link #MISMATCH_LOG_INTERVAL_MS} 只允许输出一条。这与本类其它几条
+     * （{@link #noteDropped} / {@link #noteBadId}）是同一个口径——网络输入驱动的日志
+     * 一律限频，且限频判据不能依赖输入内容的多样性。</p>
+     *
+     * <p>取 60 秒：与那两条同值。被压掉的条目在窗口结束时**聚合报告**
+     * （"另有 N 条同类"），所以发生 1000 次时读者仍然知道规模，只是不必读 1000 行。</p>
+     */
+    static final long MISMATCH_LOG_INTERVAL_MS = 60_000L;
+
+    private long lastMismatchLogAtMs;
+    private int mismatchSuppressed;
 
     /**
      * 记录一次"包里自称的身份与来源后端对不上"。
@@ -255,32 +292,86 @@ public final class PerfScopeVelocity {
      *       告警把这两个名字并排写出来，服主一眼就能对上。</li>
      * </ul>
      *
-     * <p>两种都按 (id, 后端名) 去重：配置稳定时同一对组合只报一次，改回一致后自然不再出现。</p>
+     * <p>两层限频：① 同一对 (id, 后端名) 只报一次；② 全局每 {@link #MISMATCH_LOG_INTERVAL_MS}
+     * 最多一条，被压掉的计数在下一条里带出来。第二层是必须的——第一层能被"每包换个 id"绕过，
+     * 而那正是抢占攻击的自然形状。</p>
      */
     private synchronized void noteSourceMismatch(String claimedId, String originName, boolean rejected) {
+        noteSourceMismatch(claimedId, originName, rejected, System.currentTimeMillis());
+    }
+
+    /**
+     * 同上，但显式给出"现在"。
+     *
+     * <p><b>为什么需要这个重载</b>：限频的<b>被限部分</b>（"另有 N 条已被省略"）只会在
+     * <b>下一个窗口</b>输出的那条里出现。用 {@link System#currentTimeMillis()} 时，
+     * 测试无法把时间推过一个窗口，于是"被压掉的条数会被报出来"这件事测不到——
+     * 而那正是"限频"与"直接把日志丢掉"的区别。与 {@code NetworkView.onPacket(packet,
+     * receivedAtMs)} 是同一个理由，同一手法。</p>
+     */
+    synchronized void noteSourceMismatch(String claimedId, String originName, boolean rejected,
+                                         long now) {
         String key = mismatchKey(claimedId, originName, rejected);
+
+        // 第一层：同一对 (id, 后端名) **一辈子只报一次**。
+        //
+        // 这一层回答的是"这台后端配错了没有"，而配置是稳定的——真实的"名字不一致"部署
+        // 会在每个采集周期都命中同一条，不去重就是一天 1440 条。它不能省掉，
+        // 也不能只靠下面那层全局限频代替：全局限频是"每个窗口一条"，于是一台配置稳定
+        // 但名字对不上的后端会**永远**每分钟报一条，日志里永远有一条消除不掉的噪音。
         if (mismatchWarned.containsKey(key)) {
             return;
         }
-        // 记忆表要有界：恶意后端可以不断换 id 把这张表撑大（与 NetworkView 的
-        // MAX_TRACKED_SERVERS 同一个理由）。到这里时 server-id 已过长度闸门（≤64），
-        // 但数量仍无上限，所以封顶后整体清空而不是无限增长——重报一次的成本远低于无界。
-        if (mismatchWarned.size() >= 512) {
-            mismatchWarned.clear();
-        }
         mismatchWarned.put(key, Boolean.TRUE);
+        if (mismatchWarned.size() > MISMATCH_WARNED_MAX) {
+            java.util.Iterator<String> it = mismatchWarned.keySet().iterator();
+            if (it.hasNext()) {
+                it.next();
+                it.remove();
+            }
+        }
+
+        // 第二层：全局每 MISMATCH_LOG_INTERVAL_MS 最多输出一条。
+        //
+        // 这一层回答的是"有没有人在换着 id 刷"。它必须与内容无关，因为第一层的键
+        // 完全由发方控制：每包换一个 id 就得到一个新的键，第一层因此形同不存在
+        // （实测 1000 个 id → 1000 条 WARN）。
+        //
+        // 顺序说明：两条检查都做了才往下走——去重先执行并**已经**把键记进表，
+        // 所以被全局限频压掉的那些组合**不会**在下一个窗口重新冒出来。
+        // 反过来（先判限频再记键）会让它们永远进不了去重表，窗口一过又全部重报。
+        if (lastMismatchLogAtMs != 0L && now - lastMismatchLogAtMs < MISMATCH_LOG_INTERVAL_MS) {
+            mismatchSuppressed++;
+            return;
+        }
+        int suppressed = mismatchSuppressed;
+        mismatchSuppressed = 0;
+        lastMismatchLogAtMs = now;
+
         if (rejected) {
             logger.warn("丢弃一条跨服摘要：它自称 server-id=\"{}\"，但该身份已被另一条后端占用，"
                     + "而这条消息来自后端 \"{}\"。同一个 server-id 只能由一个后端上报——"
-                    + "请检查各后端的 network.server-id 是否配成了同一个值。",
-                claimedId, originName);
+                    + "请检查各后端的 network.server-id 是否配成了同一个值。{}",
+                claimedId, originName, suppressedSuffix(suppressed));
         } else {
             logger.warn("跨服摘要的 server-id=\"{}\" 与它来自的后端 \"{}\" 不一致。"
                     + "数据已接受，但面板上可能出现两行（velocity.toml 的名字显示「无数据」、"
                     + "server-id 显示数据）。若想让它们合成一行，请把该后端的 network.server-id "
-                    + "改得与 velocity.toml 里的名字逐字一致。",
-                claimedId, originName);
+                    + "改得与 velocity.toml 里的名字逐字一致。{}",
+                claimedId, originName, suppressedSuffix(suppressed));
         }
+    }
+
+    /**
+     * 被限频压掉的条数后缀。
+     *
+     * <p>被压掉的必须<b>说出来多少条</b>：只限频不计数，会让"每小时 1 次"和
+     * "每小时 60000 次"看起来一模一样——而这两件事的处理优先级完全不同。
+     * 空串（无抑制）时不留多余空格。</p>
+     */
+    private static String suppressedSuffix(int suppressed) {
+        return suppressed <= 0 ? "" : "（近 " + (MISMATCH_LOG_INTERVAL_MS / 1000L)
+            + " 秒内另有 " + suppressed + " 条同类告警已被省略）";
     }
 
     private static String mismatchKey(String claimedId, String originName, boolean rejected) {
@@ -338,8 +429,8 @@ public final class PerfScopeVelocity {
             REJECT_SQUAT
         }
 
-        /** server-id → 已经用它上报过的后端名。 */
-        private final Map<String, String> boundTo = new HashMap<>();
+        /** server-id → 已经用它上报过的后端名（**按最近使用排序**，见 {@link #BINDINGS_MAX}）。 */
+        private final Map<String, String> boundTo = new java.util.LinkedHashMap<>();
 
         /**
          * 判定一次上报。
@@ -358,9 +449,7 @@ public final class PerfScopeVelocity {
             if (bound == null) {
                 // 这个 id 从没被任何后端用过 —— 第一眼看到谁就绑谁。有界：见 BINDINGS_MAX。
                 if (boundTo.size() >= BINDINGS_MAX) {
-                    // 与 mismatchWarned 同理：宁可整体清空（重新绑定会放过一次抢占窗口），
-                    // 也不让一张网络输入驱动的表无限增长。
-                    boundTo.clear();
+                    evictOldest();
                 }
                 boundTo.put(claimedId, originName);
                 // 第一次见到这个 id：即便名字和 velocity.toml 不一致也只是"建议未遵守"，
@@ -369,10 +458,45 @@ public final class PerfScopeVelocity {
             }
             if (bound.equals(originName)) {
                 // 同一个 id、同一条后端 —— 正常。名字是否等于后端名不影响（见类注释）。
+                //
+                // 顺手把它挪到队尾：这条表按"最近是否活跃"淘汰，而**一直在正常上报的
+                // 后端必须永远不被淘汰**——它恰恰是最需要保住绑定的那一类。
+                // 不刷新访问序的话，一台静默了几分钟（比如空服）后恢复的后端，
+                // 它的条目可能已经被后来涌入的 id 挤到队头。
+                touch(claimedId, originName);
                 return claimedId.equals(originName) ? Verdict.OK : Verdict.WARN_MISMATCH;
             }
             // 同一个 id、**不同的**后端 —— 这就是 A 覆盖 B 的形状。
             return Verdict.REJECT_SQUAT;
+        }
+
+        /**
+         * 淘汰最久没被用过的绑定。
+         *
+         * <p><b>为什么不能整体 {@code clear()}（这是本批修的那个 P3）</b>：
+         * 清表会<b>重开抢占窗口</b>。攻击者只要灌满 512 个新 id 触发扩容，表一清，
+         * 真正受害者的绑定就没了——攻击者紧接着用受害者的 id 上报，成了"第一次出现"，
+         * 于是绑定成功；而真正的受害者下一次上报被判 {@code REJECT_SQUAT}
+         * <b>永久出局</b>。实测路径：受害者先绑定 → 攻击者灌 512 个新 id → 清表 →
+         * 攻击者抢到 id → 真正受害者永久丢包。</p>
+         *
+         * <p>LRU 淘汰下这个攻击依然存在（攻击者总能挤掉最旧的条目），但它需要
+         * <b>持续</b>灌流量、且只影响"最久没动过"的那一条；而 {@code clear()} 是
+         * 一次动作清掉<b>全部</b>绑定，包括所有健康后端的。两者的代价差一个数量级，
+         * 而且 LRU 至少让"活跃的后端不会被动"这条性质成立。</p>
+         */
+        private void evictOldest() {
+            java.util.Iterator<String> it = boundTo.keySet().iterator();
+            if (it.hasNext()) {
+                it.next();
+                it.remove();
+            }
+        }
+
+        /** 把一条绑定挪到队尾（最近使用）。用手写 remove+put 而不是 LinkedHashMap 的 accessOrder。 */
+        private void touch(String claimedId, String originName) {
+            boundTo.remove(claimedId);
+            boundTo.put(claimedId, originName);
         }
 
         /** 绑定表上限（网络输入驱动，必须有界）。 */

@@ -522,6 +522,98 @@ class SummaryTest {
         assertTrue(over.endsWith("…"), "截断要看得出来，实际是：" + over);
     }
 
+    // ==================== 渲染层的宽度只量一遍（ColumnLayout） ====================
+
+    @Test
+    @DisplayName("ColumnLayout：每格宽度只量一次，渲染结果与 padTo 逐字节相同")
+    void columnLayoutIsByteIdenticalToPaddingEachCell() {
+        // 这条守的是"优化改了实现、没改输出"：
+        //   旧链路 = columnWidths 出一份 int[]，再对每格调 padTo（padTo 内部又要量一次宽度）
+        //   新链路 = columnWidths 同时留下每格宽度，ColumnLayout.render 直接按已知宽度补
+        // 两者必须给出**逐字相同**的整行字符串。用一组覆盖多状态/多宽度/全半角的输入来比，
+        // 而不是只比一行——列宽是"全表最大值"，单行输入下这个错误根本不会暴露。
+        long now = 200_000L;
+        NetworkView view = new NetworkView();
+        feed(view, okPacket("ok-1", now - 1_000L, 20.0, 5));
+        feed(view, okPacket("stale-1", now - 40_000L, 19.5, 0));
+        feed(view, okPacket("生存服", now - 2_000L, 17.0, 3));
+        feed(view, okPacket("a-very-long-backend-name", now - 3_000L, 14.0, 1));
+        feed(view, okPacket("🎮server", now - 4_000L, 0.0, 42));
+        List<NetworkView.Node> nodes = view.snapshot(now, 10, List.of("no-data-1"));
+
+        List<NetworkRenderer.Row> rows = NetworkRenderer.render(nodes);
+        NetworkRenderer.ColumnLayout layout = NetworkRenderer.columnWidths(rows, NetworkRenderer.HEADERS);
+
+        String[] expected = new String[rows.size()];
+        for (int r = 0; r < rows.size(); r++) {
+            List<NetworkRenderer.Cell> cells = rows.get(r).cells();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < cells.size(); i++) {
+                if (i > 0) sb.append("  ");
+                // 旧链路的写法：每格重新量一次宽度再补
+                sb.append(i == cells.size() - 1
+                    ? cells.get(i).text()
+                    : NetworkRenderer.padTo(cells.get(i).text(), layout.column(i)));
+            }
+            expected[r] = sb.toString();
+        }
+
+        for (int r = 0; r < rows.size(); r++) {
+            List<NetworkRenderer.Cell> cells = rows.get(r).cells();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < cells.size(); i++) {
+                if (i > 0) sb.append("  ");
+                sb.append(i == cells.size() - 1
+                    ? cells.get(i).text()
+                    : layout.render(r, i, cells.get(i).text()));
+            }
+            assertEquals(expected[r], sb.toString(),
+                "第 " + r + " 行变了：新链路的填充结果必须与逐格 padTo 逐字节相同");
+        }
+
+        // 不变式仍成立：每一格补完后恰好占它所在列的宽度（最后一列不补）。
+        for (int r = 0; r < rows.size(); r++) {
+            List<NetworkRenderer.Cell> cells = rows.get(r).cells();
+            for (int i = 0; i < cells.size() - 1; i++) {
+                assertEquals(layout.column(i),
+                    NetworkRenderer.displayWidth(layout.render(r, i, cells.get(i).text())),
+                    "第 " + r + " 行第 " + i + " 格补完后的宽度不等于列宽");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("ASCII 快路径：宽度仍与逐字素簇扫描一致（keycap / VS16 不算错）")
+    void asciiFastPathDoesNotChangeWidths() {
+        // 快路径是为了省掉字素簇二分查找，但它的判据必须是"**整串**都是 ASCII"。
+        // 曾经写错成"扫到第一个非 ASCII 就停、把前面那段按 1 格算"，于是
+        // `1️⃣`（`1` + U+FE0F + U+20E3，一个字素簇、宽 2）被算成 1 格，
+        // 整行少一格。这条把几类"ASCII 基字符 + 非 ASCII 附加符"组合全部钉住。
+        assertEquals(2, NetworkRenderer.displayWidth("1️⃣"), "keycap 是 2 格");
+        assertEquals(2, NetworkRenderer.displayWidth("❤️"), "ASCII 之外的基字符 + VS16");
+        assertEquals(1, NetworkRenderer.displayWidth("x"), "纯 ASCII 仍是长度");
+        assertEquals(5, NetworkRenderer.displayWidth("19.84"));
+        // 前缀是 ASCII、后缀是非 ASCII：不能把前缀单独按"每字符 1 格"糊过去。
+        assertEquals(2 + 3, NetworkRenderer.displayWidth("中abc"), "汉字 2 + 3 个 ASCII");
+    }
+
+    @Test
+    @DisplayName("ColumnLayout：宽度未知的越界格退回自量，不补错格数")
+    void columnLayoutFallsBackWhenWidthIsUnknown() {
+        // 越界格（调用方传入的行号/列号超出布局范围）必须退回 padTo 的自量路径，
+        // 而不是拿一个假的 0 去补——"补错格数"会让整列错位，且没有任何地方会报错。
+        List<NetworkRenderer.Row> rows = List.of(
+            NetworkRenderer.renderOne(new NetworkView().snapshot(1000L, 10, List.of("x")).get(0)));
+        NetworkRenderer.ColumnLayout layout = NetworkRenderer.columnWidths(rows, NetworkRenderer.HEADERS);
+        String out = layout.render(999, 0, "abc");
+        assertEquals(layout.column(0), NetworkRenderer.displayWidth(out),
+            "越界行号也要给出恰好占列宽的串");
+        // 越界列号没有"目标宽度"可言：原样返回文本，绝不抛异常——一行拼到一半炸掉
+        // 会让整条命令失败，而面板拼不出来比一列没对齐严重得多。
+        assertEquals("abc", layout.render(0, 99, "abc"), "越界列号必须原样返回，不能抛");
+        assertEquals("", layout.render(0, -1, null), "null 也不能漏出去变成 NPE");
+    }
+
     @Test
     @DisplayName("列宽：emoji / 组合字符 / 半角假名 / 希腊字母的宽度判据")
     void displayWidthHandlesNonAsciiUntruthfully() {
@@ -590,6 +682,62 @@ class SummaryTest {
     }
 
     @Test
+    @DisplayName("列宽：尾部 ZWJ 不会被算成连字（displayWidth 与 padTo 的契约）")
+    void trailingZeroWidthJoinerDoesNotClaimAJoiner() {
+        // 修复前 clusterAt **无条件**吞掉 ZWJ 后的下一个码点，于是 "x‍" 被算成
+        // 一个 2 格的字素簇（真实渲染是 1 格）。后果不是难看：
+        // padTo("x‍", 3) 只返回宽度 2 的串，破坏了"返回串恰好 width 格"这个
+        // 调用方唯一依赖的契约。实测 4000 例含 ZWJ 的样本里 235 例破约。
+        assertEquals(1, NetworkRenderer.displayWidth("x‍"),
+            "尾部 ZWJ 后面没有可连接字符，它不构成连字——真实宽度是 1 格");
+        assertEquals(3, NetworkRenderer.displayWidth(NetworkRenderer.padTo("x‍", 3)),
+            "padTo 的契约是「返回串恰好 width 格」，尾部 ZWJ 不能让结果少一格");
+        assertEquals(0, NetworkRenderer.displayWidth("‍"),
+            "孤立的 ZWJ 是格式符（Cf），按「不单独占位」算 0 格");
+
+        // 正例不退化：真正的 emoji ZWJ 序列仍必须算 2 格。
+        assertEquals(2, NetworkRenderer.displayWidth("👨‍👩‍👧‍👦"),
+            "修复不能把真正的 ZWJ 连字一起改坏");
+        assertEquals(2, NetworkRenderer.displayWidth("👩‍💻"));
+        // ZWJ + VS16 组合同样是 2 格（不是 3、也不是 1）。
+        assertEquals(2, NetworkRenderer.displayWidth("❤️‍🔥"));
+    }
+
+    @Test
+    @DisplayName("列宽：含 ZWJ 的随机样本全部满足 padTo 的宽度契约")
+    void padToContractHoldsForZwjSamples() {
+        // 结构性不变式（这条比单点断言更抗未来改动）：对任何宽度 w 与任何含 ZWJ 的串，
+        // displayWidth(padTo(s, w)) 必须**恰好**等于 w。
+        String[] samples = {
+            "x‍", "‍x", "a‍‍", "x‍‍b", "👨‍👩",
+            "‍", "ab‍", "👩‍💻", "中‍文", "x‍ "
+        };
+        for (String s : samples) {
+            for (int w = 1; w <= 8; w++) {
+                String padded = NetworkRenderer.padTo(s, w);
+                assertEquals(w, NetworkRenderer.displayWidth(padded),
+                    "s=" + escapeUnicode(s) + " w=" + w + " 时 padTo 返回了宽度 "
+                        + NetworkRenderer.displayWidth(padded) + " 的串：" + escapeUnicode(padded));
+            }
+        }
+    }
+
+    /** 把不可见字符写成 U+XXXX，让失败信息可读（ZWJ 直接打印出来看不见）。 */
+    private static String escapeUnicode(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c < 0x20 || c == 0x7F || Character.isISOControl(c)
+                || Character.getType(c) == Character.FORMAT) {
+                sb.append(String.format("\\u%04X", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    @Test
     @DisplayName("列宽：取表头与所有行的最大值，不是第一行")
     void columnWidthsUseMaxAcrossRows() {
         long now = 100_000L;
@@ -600,19 +748,19 @@ class SummaryTest {
         feed(view, okPacket("t", now - 120_000L, 19.0, 1));
         List<NetworkView.Node> nodes = view.snapshot(now, 10, List.of("a-very-long-backend-name"));
         List<NetworkRenderer.Row> rows = NetworkRenderer.render(nodes);
-        int[] w = NetworkRenderer.columnWidths(rows, NetworkRenderer.HEADERS);
+        NetworkRenderer.ColumnLayout layout = NetworkRenderer.columnWidths(rows, NetworkRenderer.HEADERS);
 
-        assertEquals(NetworkRenderer.displayWidth("TPS(1m)"), w[2]);
+        assertEquals(NetworkRenderer.displayWidth("TPS(1m)"), layout.column(2));
 
         // 后端名带横线（`a-very-long-backend-name` = 24 格）已经超过 MAX_ID_DISPLAY_WIDTH(20)，
         // 渲染层会先把它截到 20 格并加省略号，所以列宽是 20 而不是 24。
-        assertEquals(NetworkRenderer.MAX_ID_DISPLAY_WIDTH, w[0],
+        assertEquals(NetworkRenderer.MAX_ID_DISPLAY_WIDTH, layout.column(0),
             "第 1 列（后端名）必须被封在 MAX_ID_DISPLAY_WIDTH，而不是容器里的 24 格");
 
         // 不变式：任一格的宽度都不超过它所在列的宽度，否则填充是假的。
         for (NetworkRenderer.Row row : rows) {
             for (int i = 0; i < row.cells().size(); i++) {
-                assertTrue(NetworkRenderer.displayWidth(row.cells().get(i).text()) <= w[i],
+                assertTrue(NetworkRenderer.displayWidth(row.cells().get(i).text()) <= layout.column(i),
                     "第 " + i + " 格超出了列宽：" + row.cells().get(i).text());
             }
         }
@@ -629,15 +777,16 @@ class SummaryTest {
         feed(view, okPacket(wideName, now - 1_000L, 20.0, 3));
         List<NetworkRenderer.Row> rows =
             NetworkRenderer.render(view.snapshot(now, 10, List.of()));
-        int[] w = NetworkRenderer.columnWidths(rows, NetworkRenderer.HEADERS);
+        NetworkRenderer.ColumnLayout layout = NetworkRenderer.columnWidths(rows, NetworkRenderer.HEADERS);
 
         // 第 1 列的宽度来自**实际渲染出的格子**（已截断），所以是 ≤ 上限，不会是容器里的 128 格。
         // 注意它可能是 19 而不是 20：预算是 19 格（20 减去省略号那 1 格），汉字占 2 格，
         // 于是最多用掉 18 格再加 1 格省略号。差这 1 格是字素簇边界切分的结果，不是漏洞。
-        assertTrue(w[0] <= NetworkRenderer.MAX_ID_DISPLAY_WIDTH,
-            "第 1 列必须被封在 MAX_ID_DISPLAY_WIDTH 以内，实际是 " + w[0]);
-        assertTrue(w[0] >= NetworkRenderer.MAX_ID_DISPLAY_WIDTH - 1,
-            "也不该白白浪费一格，实际是 " + w[0]);
+        int col0 = layout.column(0);
+        assertTrue(col0 <= NetworkRenderer.MAX_ID_DISPLAY_WIDTH,
+            "第 1 列必须被封在 MAX_ID_DISPLAY_WIDTH 以内，实际是 " + col0);
+        assertTrue(col0 >= NetworkRenderer.MAX_ID_DISPLAY_WIDTH - 1,
+            "也不该白白浪费一格，实际是 " + col0);
         String cellText = rows.get(0).cells().get(0).text();
         assertTrue(NetworkRenderer.displayWidth(cellText) <= NetworkRenderer.MAX_ID_DISPLAY_WIDTH,
             "后端名格超宽：" + cellText);
@@ -647,8 +796,8 @@ class SummaryTest {
 
         // 整行总宽度有上界：6 列各封 MAX_CELL_WIDTH，加 5 处两空格分隔。
         int total = 0;
-        for (int i = 0; i < w.length; i++) total += w[i];
-        assertTrue(total + 2 * (w.length - 1) <= 6 * NetworkRenderer.MAX_CELL_WIDTH + 10,
+        for (int i = 0; i < layout.columnCount(); i++) total += layout.column(i);
+        assertTrue(total + 2 * (layout.columnCount() - 1) <= 6 * NetworkRenderer.MAX_CELL_WIDTH + 10,
             "整行宽度的上界不成立：" + total);
     }
 
@@ -659,10 +808,10 @@ class SummaryTest {
         // 这条直接把一格里塞进一个荒谬的长串，断言列宽仍被封住、且 padTo 会截断它。
         List<NetworkRenderer.Row> rows = List.of(
             NetworkRenderer.renderOne(new NetworkView().snapshot(1000L, 10, List.of("x")).get(0)));
-        int[] w = NetworkRenderer.columnWidths(rows, NetworkRenderer.HEADERS);
-        for (int i = 0; i < w.length; i++) {
-            assertTrue(w[i] <= NetworkRenderer.MAX_CELL_WIDTH,
-                "第 " + i + " 列超过了 MAX_CELL_WIDTH：" + w[i]);
+        NetworkRenderer.ColumnLayout layout = NetworkRenderer.columnWidths(rows, NetworkRenderer.HEADERS);
+        for (int i = 0; i < layout.columnCount(); i++) {
+            assertTrue(layout.column(i) <= NetworkRenderer.MAX_CELL_WIDTH,
+                "第 " + i + " 列超过了 MAX_CELL_WIDTH：" + layout.column(i));
         }
 
         // padTo 自己也得防住：即使调用方传一个夸张的宽度，返回值也不会是那个长度。
@@ -1020,7 +1169,40 @@ class SummaryTest {
     }
 
     @Test
-    @DisplayName("渲染：时钟异常整行 UNKNOWN，年龄格写「早 N」而不是「0秒前」")
+    @DisplayName("null 锚点：不 NPE（javadoc 承诺的降级必须真的存在）")
+    void nullAnchorDoesNotThrow() {
+        // javadoc 以前写「null 或未知偏移时按 0 校正」，实现却直接
+        // anchor.arrivedAtMs() → NPE。文档与实现二选一对齐，这里选**加守卫**：
+        // 一个缺失的锚点不该让整张面板崩掉（NetworkView.snapshot 本来就有降级分支）。
+        SummaryPacket p = SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"a\",\"sentAt\":1000,\"collectedAt\":1000,"
+                + "\"alive\":true,\"players\":1,\"tps1m\":20.0}"));
+
+        assertEquals(0L, p.aheadMs(null),
+            "没有锚点就没有证据说时间戳在未来 → 按「不超前」处理，而不是 NPE");
+        assertEquals(0L, p.ageMs(null),
+            "没有锚点算不出年龄 → 按「刚到」处理（0），与 snapshot 的降级方向一致");
+
+        // 反证：非 null 锚点走原路径，结果不受守卫影响。
+        SummaryPacket.PacketAnchor anchor = new SummaryPacket.PacketAnchor(1_400L, 0L);
+        assertEquals(400L, p.ageMs(anchor), "到达时刻 1400、采集 1000 → 年龄 400ms");
+        assertEquals(-400L, p.aheadMs(anchor),
+            "ahead = collectedAt - arrivedAt = 1000-1400 = -400（快照在过去）");
+    }
+
+    @Test
+    @DisplayName("null 锚点：collectedAt 缺失时仍优先返回 MISSING_TIME")
+    void nullAnchorStillReportsMissingTimestamp() {
+        // 顺序很重要：缺时间戳是**更具体**的结论，不能被"锚点也缺"抹成 0。
+        SummaryPacket p = SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"a\",\"sentAt\":1000,"
+                + "\"alive\":true,\"players\":1}"));
+        assertEquals(SummaryPacket.MISSING_TIME, p.ageMs(null),
+            "没有时间戳时必须是 MISSING_TIME（-1），不是 0 —— 否则会显示「0秒前」");
+    }
+
+    @Test
+    @DisplayName("渲染：时钟异常**整行** UNKNOWN，年龄格写「早 N」而不是「0秒前」")
     void clockSkewRowNeverRendersZeroSeconds() {
         long now = 1_700_000_000_000L;
         NetworkView view = new NetworkView();
@@ -1034,16 +1216,43 @@ class SummaryTest {
         NetworkRenderer.Row row = NetworkRenderer.renderOne(
             view.snapshot(now, 10, List.of()).get(0));
         assertEquals("时钟异常", row.cells().get(1).text());
-        // 第 0 格（后端名）、第 1 格（状态）、第 5 格（年龄）必须 UNKNOWN：
-        // 绿色会被读成健康，而"时钟异常"恰恰是不该下的结论。
-        assertEquals(NetworkRenderer.Level.UNKNOWN, row.cells().get(0).level());
-        assertEquals(NetworkRenderer.Level.UNKNOWN, row.cells().get(1).level());
-        assertEquals(NetworkRenderer.Level.UNKNOWN, row.cells().get(5).level());
+
+        // **整行**六格必须全是 UNKNOWN。修复前这条用例只查了第 0/1/5 三格，
+        // 于是实测 CLOCK_SKEW 行的数值格是绿色的（19.90/OK、1.5/OK、3/OK）——
+        // 一个伪造未来时间戳的后端因此能拿到**绿色的 20.00**。
+        // 注释与 CHANGELOG 都写「整行 UNKNOWN」，实现却只降了三格；
+        // 这条用例现在逐格查，把那句承诺变成可断言的。
+        for (int i = 0; i < 6; i++) {
+            assertEquals(NetworkRenderer.Level.UNKNOWN, row.cells().get(i).level(),
+                "时钟异常行第 " + i + " 格（" + row.cells().get(i).text()
+                    + "）不是 UNKNOWN——伪造时间戳不该换到任何绿色");
+        }
+        // 文字仍然保留：读者能看出"最后是 19.9"，只是不会被涂成健康。
+        assertEquals("19.90", row.cells().get(2).text());
+
         String ageCell = row.cells().get(5).text();
         assertTrue(ageCell.contains("早 1小时"),
             "年龄格要说明超前多少，实际是：" + ageCell);
         assertFalse(ageCell.contains("0秒前"),
             "「0秒前」正是伪造时间戳想换来的那句话，绝不能出现：" + ageCell);
+    }
+
+    @Test
+    @DisplayName("渲染：数据过期行也是整行 UNKNOWN（数值不能挂着绿色）")
+    void staleRowIsEntirelyUnknown() {
+        // 同一类"注释承诺整行、实现只降三格"的缺陷。过期行上挂着绿色 19.50，
+        // 读者会把它当成"现在健康"——而面板自己的判据已经说了这数据过期了。
+        long now = 100_000L;
+        NetworkView view = new NetworkView();
+        feed(view, okPacket("stale", now - 120_000L, 19.5, 3));
+        NetworkRenderer.Row row = NetworkRenderer.renderOne(
+            find(view.snapshot(now, 10, List.of()), "stale"));
+
+        for (int i = 0; i < 6; i++) {
+            assertEquals(NetworkRenderer.Level.UNKNOWN, row.cells().get(i).level(),
+                "数据过期行第 " + i + " 格（" + row.cells().get(i).text() + "）不是 UNKNOWN");
+        }
+        assertEquals("19.50", row.cells().get(2).text(), "文字保留，只降级颜色");
     }
 
     @Test
@@ -1448,5 +1657,332 @@ class SummaryTest {
         }
         assertTrue(binder.size() <= PerfScopeVelocity.SourceBinder.BINDINGS_MAX,
             "绑定表必须封顶，否则恶意后端能用不断变化的 id 把它撑大");
+    }
+
+    @Test
+    @DisplayName("来源绑定：满了之后淘汰最久未用的，而不是整体清空（清表会重开抢占窗口）")
+    void bindingTableEvictsLruInsteadOfClearingEverything() {
+        PerfScopeVelocity.SourceBinder binder = new PerfScopeVelocity.SourceBinder();
+
+        // 受害者先绑定，并且**持续活跃**（正常后端每 10 秒一包）。
+        assertEquals(PerfScopeVelocity.SourceBinder.Verdict.OK, binder.bind("victim", "victim"));
+
+        // 攻击者灌满剩下的名额，中途还不断刷新受害者的活跃度（模拟真实上报节奏）。
+        int cap = PerfScopeVelocity.SourceBinder.BINDINGS_MAX;
+        for (int i = 0; i < cap * 2; i++) {
+            binder.bind("flood" + i, "attacker" + i);
+            if (i % 100 == 0) {
+                binder.bind("victim", "victim");   // 受害者仍然活着
+            }
+        }
+
+        // 关键断言：受害者的绑定必须还在。修复前 boundTo.clear() 会把所有绑定抹掉，
+        // 于是攻击者紧接着用 "victim" 上报会被当成"第一次出现"而绑定成功。
+        assertEquals("victim", binder.boundServerOf("victim"),
+            "活跃的绑定不能被一次扩容动作清掉——清表会重开抢占窗口");
+        // 而攻击者此刻用受害者的 id 冒名，必须仍然被拒。
+        assertEquals(PerfScopeVelocity.SourceBinder.Verdict.REJECT_SQUAT,
+            binder.bind("victim", "attacker0"),
+            "受害者的绑定还在，所以冒充仍然被拒。修复前 boundTo 被整体清空，这里会是 OK");
+    }
+
+    @Test
+    @DisplayName("来源绑定：淘汰的是最久未用的那条，不是随便一条")
+    void bindingTableEvictsTheLeastRecentlyUsedEntry() {
+        PerfScopeVelocity.SourceBinder binder = new PerfScopeVelocity.SourceBinder();
+        int cap = PerfScopeVelocity.SourceBinder.BINDINGS_MAX;
+
+        // 先放满：oldest 排在最前，newest 排在最后。
+        binder.bind("oldest", "oldest");
+        for (int i = 1; i < cap; i++) {
+            binder.bind("id" + i, "backend" + i);
+        }
+        // 刷新一下 "oldest"，让它变成"最近用过"。
+        binder.bind("oldest", "oldest");
+
+        // 再放一条新的：被挤掉的应该是 id1（现在是队头），而不是 oldest。
+        binder.bind("overflow", "overflow");
+
+        assertNotNull(binder.boundServerOf("oldest"),
+            "oldest 刚被访问过，不该是淘汰目标");
+        assertNull(binder.boundServerOf("id1"),
+            "id1 是最久未用的，应当被淘汰。若实现改成 clear()，这条会是 null 但仍不符合本用例语义");
+    }
+
+    // ==================== 数据年龄显示（P0 回归） ====================
+
+    /**
+     * 静默一段时间后，<b>年龄格绝不能写「0秒前」</b>。
+     *
+     * <p>这是本批引入的回归：判定改用 {@code silentMs} 之后，显示层还在用锚定的 {@code age}，
+     * 而它锚定在包到达的那一刻，所以几乎恒为 0。于是：</p>
+     *
+     * <ul>
+     *   <li>静默 31 秒（刚越过 3×10s 阈值）→ 「0秒前（可能空服）」</li>
+     *   <li>静默 120 秒 → 「0秒前（可能空服）」</li>
+     *   <li>静默 3600 秒 → 「0秒前（可能空服）」</li>
+     *   <li>采集器死一小时 → 「0秒前（数字已冻结）」</li>
+     * </ul>
+     *
+     * <p>也就是说：<b>把"已经一小时没数据"写成"0 秒前"</b>——正是本项目反复要禁的那类
+     * 谎报，且出现在最需要看年龄的两行上。</p>
+     *
+     * <p>这条用例逐点断言"不等于 0秒前"，并额外断言方向（秒级→分钟级→小时级）
+     * 没有退化——只断言"不等于 0秒前"的话，一个恒返回「—」的实现也能通过。</p>
+     */
+    @Test
+    @DisplayName("数据年龄：静默 31s / 120s / 3600s / 采集器死 1 小时，都不许写「0秒前」")
+    void ageCellNeverSaysZeroSecondsAfterSilence() {
+        long t0 = 1_700_000_000_000L;
+        int interval = 10;   // 过期阈值 = 30 秒
+
+        // 四个场景：静默 31s（刚过期）/ 120s（过期两分钟）/ 3600s（一小时）/ 采集器死一小时。
+        long[] silences = {31_000L, 120_000L, 3_600_000L};
+        String[] expected = {"31秒前", "2分钟前", "1小时前"};
+
+        for (int i = 0; i < silences.length; i++) {
+            NetworkView view = new NetworkView();
+            // 包在 t0 时刻"采集且到达"（age ≈ 0，这正是真实情形：包刚采完就发出去了）。
+            SummaryPacket p = SummaryPacket.parse(json(
+                "{\"v\":1,\"kind\":\"summary\",\"server\":\"s\",\"sentAt\":" + t0
+                    + ",\"collectedAt\":" + t0 + ",\"alive\":true,\"players\":2,"
+                    + "\"tps1m\":19.5,\"msptAvg\":12.0,\"pushIntervalSec\":10}"));
+            view.onPacket(p, t0);
+
+            long now = t0 + silences[i];
+            NetworkView.Node n = view.snapshot(now, interval, List.of()).get(0);
+            assertEquals(NetworkView.State.STALE, n.state(),
+                "静默 " + silences[i] + "ms 必然越过 30s 阈值");
+
+            NetworkRenderer.Row row = NetworkRenderer.renderOne(n);
+            String ageCell = row.cells().get(5).text();
+            assertFalse(ageCell.contains("0秒前"),
+                "静默 " + silences[i] + "ms 后年龄格写了「0秒前」——"
+                    + "这正是本批引入的回归：显示层用了锚定 age（恒 0）而不是静默时长。"
+                    + "实际：" + ageCell);
+            assertTrue(ageCell.contains(expected[i]),
+                "静默 " + silences[i] + "ms 应显示「" + expected[i] + "」，实际：" + ageCell);
+        }
+
+        // 采集器死：包还在到（collectedAt 冻结），但 alive=false。
+        NetworkView deadView = new NetworkView();
+        long deadCollectedAt = t0;
+        SummaryPacket dead = SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"d\",\"sentAt\":" + deadCollectedAt
+                + ",\"collectedAt\":" + deadCollectedAt + ",\"alive\":false,\"players\":1,"
+                + "\"tps1m\":20.0,\"pushIntervalSec\":10}"));
+        deadView.onPacket(dead, t0);
+        NetworkView.Node deadNode = deadView.snapshot(t0 + 3_600_000L, interval, List.of()).get(0);
+        assertEquals(NetworkView.State.COLLECTOR_DEAD, deadNode.state());
+        String deadAge = NetworkRenderer.renderOne(deadNode).cells().get(5).text();
+        assertFalse(deadAge.contains("0秒前"),
+            "采集器死 1 小时后年龄格写了「0秒前」——把「已经一小时没数据」写成「刚采的」。"
+                + "实际：" + deadAge);
+        assertTrue(deadAge.contains("1小时前"), "应显示「1小时前」，实际：" + deadAge);
+        assertTrue(deadAge.contains("数字已冻结"), "采集已停行要说明数字是冻结的：" + deadAge);
+    }
+
+    @Test
+    @DisplayName("数据年龄：OK 行的年龄也在增长（它不是恒 0 的装饰）")
+    void okRowAgeAlsoAdvances() {
+        // OK 行同样受影响：只要还在正常上报，静默时长就是 0～3×间隔，年龄随间隔走。
+        // 修复前它恒为「0秒前」——看上去像"永远刚刚采到"。
+        long t0 = 1_700_000_000_000L;
+        NetworkView view = new NetworkView();
+        SummaryPacket p = SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"a\",\"sentAt\":" + t0
+                + ",\"collectedAt\":" + t0 + ",\"alive\":true,\"players\":3,"
+                + "\"tps1m\":20.0,\"msptAvg\":11.0,\"pushIntervalSec\":10}"));
+        view.onPacket(p, t0);
+
+        // 20 秒后：仍在 30 秒阈值内 → OK，但年龄应该是 20 秒而不是 0 秒。
+        NetworkView.Node n = view.snapshot(t0 + 20_000L, 10, List.of()).get(0);
+        assertEquals(NetworkView.State.OK, n.state());
+        String cell = NetworkRenderer.renderOne(n).cells().get(5).text();
+        assertEquals("20秒前", cell,
+            "OK 行的年龄必须反映真实数据年龄，而不是恒 0");
+    }
+
+    @Test
+    @DisplayName("数据年龄：采集→到达的耗时也计入（dataAge = 静默 + 锚定年龄）")
+    void dataAgeSumsSilenceAndAnchoredAge() {
+        // 这条钉住口径本身：只显示静默时长会漏掉"包在路上/采集本身花了多久"那一截，
+        // 只显示锚定年龄会把静默整段丢掉。两者相加才对。
+        long collectedAt = 1_700_000_000_000L;
+        long arrivedAt = collectedAt + 400L;      // 采集→到达 0.4 秒
+        NetworkView view = new NetworkView();
+        view.onPacket(SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"a\",\"sentAt\":" + (collectedAt + 400L)
+                + ",\"collectedAt\":" + collectedAt + ",\"alive\":true,\"players\":1,"
+                + "\"tps1m\":20.0,\"pushIntervalSec\":10}")), arrivedAt);
+
+        NetworkView.Node n = view.snapshot(arrivedAt + 5_000L, 10, List.of()).get(0);
+        assertEquals(400L, n.ageMs(), 1L, "锚定年龄 = 采集→到达");
+        assertEquals(5_000L, n.silentMs(), 1L, "静默时长 = 到达→现在");
+        assertEquals(5_400L, n.dataAgeMs(), 1L,
+            "数据年龄 = 静默 + 锚定年龄，这才是「这块数据现在多旧」");
+        assertTrue(NetworkRenderer.renderOne(n).cells().get(5).text().contains("5秒前"),
+            "渲染用的是数据年龄（5.4 秒 → 5秒前），不是其中任何一个分量");
+    }
+
+    @Test
+    @DisplayName("数据年龄：时间戳缺失的旧版包用静默时长兜底，不出现「490000小时前」")
+    void missingTimestampFallsBackToSilence() {
+        long t0 = 1_700_000_000_000L;
+        NetworkView view = new NetworkView();
+        // collectedAt = 0：旧版后端 / 外来包。它的 collectedAt 是"纪元零点"，
+        // 照原样算年龄会得到 490000 小时这种荒谬数字。
+        view.onPacket(SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"old\",\"sentAt\":0,\"collectedAt\":0,"
+                + "\"alive\":true,\"players\":1,\"tps1m\":19.0,\"pushIntervalSec\":10}")), t0);
+
+        NetworkView.Node n = view.snapshot(t0 + 45_000L, 10, List.of()).get(0);
+        assertEquals(NetworkView.State.STALE, n.state(), "时间戳缺失按「数据过期」处理");
+        String cell = NetworkRenderer.renderOne(n).cells().get(5).text();
+        assertTrue(cell.contains("45秒前"),
+            "缺失时间戳时用静默时长（45 秒）作为可信下界，实际：" + cell);
+        assertFalse(cell.contains("小时前") || cell.contains("年前"),
+            "绝不能把纪元零点算成真实年龄，实际：" + cell);
+    }
+
+    // ==================== 时间戳"太旧"（P2） ====================
+
+    @Test
+    @DisplayName("时间戳太旧：collectedAt=1969 判时钟异常，不给绿色 20.00")
+    void absurdlyOldTimestampIsNotTrusted() {
+        // 修复前只有"太新"这一侧有闸门。collectedAt=1969 的包算出巨大的正年龄，
+        // 状态照常 OK、参与全网平均，面板上给出**绿色的 20.00** 和「498888小时前」。
+        long now = 1_700_000_000_000L;
+        NetworkView view = new NetworkView();
+        view.onPacket(SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"ancient\",\"sentAt\":" + now
+                + ",\"collectedAt\":-1000,\"alive\":true,\"players\":4,"
+                + "\"tps1m\":20.0,\"msptAvg\":10.0,\"pushIntervalSec\":10}")), now);
+
+        NetworkView.Node n = view.snapshot(now, 10, List.of()).get(0);
+        // collectedAt < 0 走的是"时间戳缺失"分支（那是"没有时间戳"，结论是数据过期），
+        // 与"时间戳荒谬地旧"是两件事——这里先确认它没被当成 OK。
+        assertTrue(n.state() != NetworkView.State.OK,
+            "纪元前的时间戳绝不能是 OK，实际：" + n.state());
+
+        // 真正要防的是这个：collectedAt=1969（正数，但荒谬地旧）。
+        NetworkView old = new NetworkView();
+        long epoch1969 = 0L;   // collectedAt <= 0 会走缺失分支；用 1ms（1970-01-01）测正数路径。
+        old.onPacket(SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"ancient\",\"sentAt\":" + now
+                + ",\"collectedAt\":" + (epoch1969 + 1L) + ",\"alive\":true,\"players\":4,"
+                + "\"tps1m\":20.0,\"msptAvg\":10.0,\"pushIntervalSec\":10}")), now);
+        NetworkView.Node ancient = old.snapshot(now, 10, List.of()).get(0);
+
+        assertEquals(NetworkView.State.CLOCK_SKEW, ancient.state(),
+            "1970 年的时间戳超过 10 年上限，必须判时钟异常而不是 OK。"
+                + "修复前它是 OK 并给出绿色 20.00");
+        assertEquals(NetworkView.ClockIssue.PAST, ancient.clockIssue(),
+            "方向必须是「过去」——文案要说「落后 N」，不能与「早 N」混成一句");
+        assertFalse(ancient.contributesToAggregate(),
+            "荒谬时间戳的读数不能进全网平均");
+
+        NetworkRenderer.Row row = NetworkRenderer.renderOne(ancient);
+        assertEquals(NetworkRenderer.Level.UNKNOWN, row.cells().get(2).level(),
+            "TPS 格必须是 UNKNOWN——修复前它是绿色 20.00");
+        assertEquals("20.00", row.cells().get(2).text(), "文字保留，只降级颜色");
+        assertEquals(NetworkRenderer.Level.UNKNOWN, row.cells().get(5).level());
+        String ageCell = row.cells().get(5).text();
+        assertFalse(ageCell.contains("498888小时前"),
+            "荒谬年龄不该被当真渲染出来，实际：" + ageCell);
+        assertTrue(ageCell.contains("落后"), "过去侧要写「落后 N」，实际：" + ageCell);
+
+        Double avg = NetworkView.averageTps1m(old.snapshot(now, 10, List.of()));
+        assertNull(avg, "全网只剩这一台且它不可信，平均值必须是 null 而不是 20.00");
+    }
+
+    @Test
+    @DisplayName("时间戳太旧：正好在 10 年上限内外各一条（判据是边界不是感觉）")
+    void plausibleAgeBoundaryIsExact() {
+        long now = 1_700_000_000_000L;
+        long cap = NetworkView.MAX_PLAUSIBLE_AGE_MS;
+
+        // 正好等于上限：放行（判据是 > 而不是 >=）。
+        NetworkView atCap = new NetworkView();
+        atCap.onPacket(SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"edge\",\"sentAt\":" + now
+                + ",\"collectedAt\":" + (now - cap) + ",\"alive\":true,\"players\":1,"
+                + "\"tps1m\":20.0}")), now);
+        assertEquals(NetworkView.State.STALE,
+            atCap.snapshot(now, 10, List.of()).get(0).state(),
+            "正好 10 年属于「还能解释」，判 STALE 而不是时钟异常");
+
+        // 超一毫秒：判时钟异常。
+        NetworkView pastCap = new NetworkView();
+        pastCap.onPacket(SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"edge\",\"sentAt\":" + now
+                + ",\"collectedAt\":" + (now - cap - 1L) + ",\"alive\":true,\"players\":1,"
+                + "\"tps1m\":20.0}")), now);
+        assertEquals(NetworkView.State.CLOCK_SKEW,
+            pastCap.snapshot(now, 10, List.of()).get(0).state(),
+            "超过 10 年一毫秒就必须判时钟异常");
+    }
+
+    // ==================== 采集器已死优先于"太旧" ====================
+
+    @Test
+    @DisplayName("判定顺序：采集器已死先于时间戳太旧（结论更具体、更可行动）")
+    void collectorDeadWinsOverPastTimestamp() {
+        long now = 1_700_000_000_000L;
+        NetworkView view = new NetworkView();
+        // 时间戳荒谬地旧 **且** alive=false：两者同时成立。
+        // 该报哪个？采集器死是包自己说的、具体的、能直接去修的；"时钟有问题"是推断。
+        view.onPacket(SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"x\",\"sentAt\":" + now
+                + ",\"collectedAt\":1,\"alive\":false,\"players\":1,\"tps1m\":20.0}")), now);
+        assertEquals(NetworkView.State.COLLECTOR_DEAD,
+            view.snapshot(now, 10, List.of()).get(0).state(),
+            "采集器已死是更强的结论，不该被「时间戳可疑」抢走");
+    }
+
+    // ==================== 清表（P1） ====================
+
+    @Test
+    @DisplayName("clear() 必须连锚点一起清（否则每次 reset 都留下一整轮 id）")
+    void clearAlsoClearsAnchors() {
+        NetworkView view = new NetworkView();
+        view.onPacket(okPacket("a", 1_000L, 20.0, 1), 2_000L);
+        view.onPacket(okPacket("b", 1_000L, 19.0, 2), 2_000L);
+        assertEquals(2, view.trackedCount());
+        assertEquals(2, view.anchorCount());
+
+        view.clear();
+        assertEquals(0, view.trackedCount(), "latest 必须清空");
+        assertEquals(0, view.anchorCount(),
+            "anchors 也必须清空。修复前这条路径漏了它：正常淘汰走 onPacket 会一起删，"
+                + "但 clear() 是另一条路径——实测 10 次 reset 后表里常驻 2560 条");
+
+        // 再补一刀：重复 reset 不能让锚点表单调增长。
+        for (int i = 0; i < 10; i++) {
+            for (int k = 0; k < 256; k++) {
+                view.onPacket(okPacket("id" + k, 1_000L, 20.0, 1), 2_000L);
+            }
+            view.clear();
+        }
+        assertEquals(0, view.anchorCount(),
+            "10 轮「灌满再 reset」之后锚点表必须是空的，实测修复前是 2560 条");
+    }
+
+    @Test
+    @DisplayName("clear() 清掉锚点后，重新上报的年龄从新锚点起算（不是沿用旧到达时刻）")
+    void clearResetsAnchorsSoFreshDataLooksFresh() {
+        // 残留锚点的第二个后果（不只是内存）：reset 之后的第一包会沿用旧到达时刻，
+        // 静默时长算出一个远大于真实值的数，刚 reset 完就显示「数据过期」。
+        long t0 = 1_700_000_000_000L;
+        NetworkView view = new NetworkView();
+        view.onPacket(okPacket("a", t0, 20.0, 1), t0);
+        view.clear();
+
+        // reset 之后一小时才来第一包：它的到达时刻是 now，不是 t0。
+        long now = t0 + 3_600_000L;
+        view.onPacket(okPacket("a", now, 20.0, 1), now);
+        NetworkView.Node n = view.snapshot(now, 10, List.of()).get(0);
+        assertEquals(NetworkView.State.OK, n.state(),
+            "reset 后的第一包必须是「正常」。沿用旧锚点会让它一上来就显示「数据过期」");
     }
 }

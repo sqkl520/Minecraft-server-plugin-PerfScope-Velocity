@@ -288,6 +288,77 @@ class PerfScopeVelocityTest {
             "更不能拿一个猜出来的名字写进绑定表——那会让真正的抢占检测失效");
     }
 
+    /**
+     * 一台后端每包换一个新 id 时，告警必须被限频。
+     *
+     * <p>修复前：去重键是 (id, 后端名)，而 id 完全由发方控制 —— 每包换个 id 就得到
+     * 一个新的键，"每对组合只报一次"退化成"每包报一次"。实测 1000 个 id → <b>1000 条 WARN</b>，
+     * 一条恶意/配错的后端就能把日志刷满，把真正该看的那几条挤掉。</p>
+     *
+     * <p>修法不止是"按 id 去重"（那还是能被绕），而是再加一道与内容<b>无关</b>的
+     * 全局限频：无论来了多少种新组合，每 {@link PerfScopeVelocity#MISMATCH_LOG_INTERVAL_MS}
+     * 只输出一条，被压掉的条数在下一条里带出来。</p>
+     */
+    @Test
+    @DisplayName("日志限频：每包换 id 的后端不能刷屏（1000 包 = 一条 + 被压条数）")
+    void mismatchWarningsAreRateLimitedPerInterval() {
+        VelocityStubs.RecordingLogger sink = new VelocityStubs.RecordingLogger();
+        PerfScopeVelocity plugin = VelocityStubs.pluginWithRecordingLogger(
+            proxyServer(List.of()), sink);
+
+        long t0 = 1_700_000_000_000L;
+        // 第一个窗口：1000 条 id 各不同、且都与来源后端名不一致 → 每条的"去重键"都不同。
+        for (int i = 0; i < 1000; i++) {
+            plugin.noteSourceMismatch("id" + i, "backendA", false, t0);
+        }
+
+        int warns = sink.warnCount();
+        assertEquals(1, warns,
+            "一个 60 秒窗口内只该输出一条。修复前这里是 1000 条 —— 每包一条 WARN，"
+                + "一条后端就能把日志刷满。实际 " + warns + " 条");
+
+        // 窗口结束后必须把"被压掉了多少条"说出来：只限频不计数，会让
+        // 「60 秒 1 次」和「60 秒 1000 次」看起来一模一样，而处理优先级完全不同。
+        plugin.noteSourceMismatch("fresh", "backendA", false, t0 + 61_000L);
+        assertEquals(2, sink.warnCount(), "新窗口开了，应再输出一条");
+        String second = sink.warns().get(1);
+        assertTrue(second.contains("另有 999 条"),
+            "第二个窗口的那条必须带出被压掉的 999 条，实际：" + second);
+    }
+
+    /**
+     * 同一条包重复上报不该每包都告警——这一条与限频**是两件事**，不能只留一个。
+     *
+     * <p>只有全局限频、没有按内容去重时：一台配置稳定的后端（名字确实与
+     * {@code velocity.toml} 不一致，这是最常见的真实情形）会在每个窗口结束时报一条，
+     * 一天 1440 条。按内容去重后，同一对组合一辈子只报一次。</p>
+     */
+    @Test
+    @DisplayName("日志去重：同一对 (id, 后端名) 一辈子只报一次 —— 跨窗口也**不**重报")
+    void repeatedIdenticalMismatchIsReportedOnlyOnce() {
+        VelocityStubs.RecordingLogger sink = new VelocityStubs.RecordingLogger();
+        PerfScopeVelocity plugin = VelocityStubs.pluginWithRecordingLogger(
+            proxyServer(List.of()), sink);
+
+        long t0 = 1_700_000_000_000L;
+        // 连续 50 包，id 与来源名始终是同一样的不一致组合，全在第一个窗口内。
+        for (int i = 0; i < 50; i++) {
+            plugin.noteSourceMismatch("survival", "survival-1", false, t0 + i);
+        }
+        assertEquals(1, sink.warnCount(),
+            "同一对 (id, 后端名) 第一次就报了，之后不该再报。实际 " + sink.warnCount() + " 条");
+
+        // 关键：**跨过窗口**也不能重报。
+        //
+        // 这一条是本用例与"全局限频"的分界点。只做全局限频时，一台配置稳定但名字
+        // 确实对不上的后端（最常见的真实情形）会永远每分钟报一条——日志里有一条
+        // 永远消除不掉的噪音。去重必须按内容、且是"一辈子一次"，所以窗口推到很远之后
+        // 同一条组合仍然不该出声。
+        plugin.noteSourceMismatch("survival", "survival-1", false, t0 + 10 * 60_000L);
+        assertEquals(1, sink.warnCount(),
+            "跨了 10 分钟窗口，同一条组合仍不该重报。实际 " + sink.warnCount() + " 条");
+    }
+
     // ==================== 生命周期 ====================
 
     /**

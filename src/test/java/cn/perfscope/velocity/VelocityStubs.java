@@ -278,4 +278,72 @@ final class VelocityStubs {
         Logger logger = LoggerFactory.getLogger("pscope-velocity-test-" + SEQ.incrementAndGet());
         return new PerfScopeVelocity(server, logger, Path.of("target", "stub-data"));
     }
+
+    /**
+     * 一个把 {@code warn} 调用全部记下来的 {@link Logger} 替身。
+     *
+     * <p><b>为什么不能用真的 slf4j logger</b>：本仓库的测试类路径里没有 logback 的
+     * {@code ListAppender}（pom 只引了 velocity-api / gson / junit）。而"日志被限频到几条"
+     * 这件事**只能靠数日志条数**来断言——它没有别的可观察出口。
+     * {@link Logger} 是接口，动态代理够了。</p>
+     *
+     * <p>只接管 {@code warn}：其它级别一律走默认值（返回 void），这样"被测代码顺手打了
+     * 一条 info"不会让这里的计数虚高。</p>
+     */
+    static final class RecordingLogger {
+        private final java.util.List<String> warns = new java.util.ArrayList<>();
+
+        Logger build() {
+            return stub(Logger.class,
+                on("warn", args -> {
+                    // slf4j 有两个重载：(String) 与 (String, Object...)。
+                    // 这里把占位符按 args 里的实参格式化，这样断言能读到真正的文案
+                    // （例如带出来的 "另有 N 条同类告警已被省略"）。
+                    if (args.length == 0) {
+                        return null;
+                    }
+                    String pattern = String.valueOf(args[0]);
+                    Object[] rest = args.length >= 2 && args[1] instanceof Object[] os
+                        ? os : (args.length > 1 ? new Object[]{args[1]} : new Object[0]);
+                    warns.add(format(pattern, rest));
+                    return null;
+                }),
+                on("isWarnEnabled", args -> true));
+        }
+
+        /** 极简 slf4j 占位符格式化：只处理 {@code {}} 与末尾的 Throwable，够这里用。 */
+        private static String format(String pattern, Object[] args) {
+            StringBuilder sb = new StringBuilder();
+            int argIdx = 0;
+            int i = 0;
+            while (i < pattern.length()) {
+                int at = pattern.indexOf("{}", i);
+                if (at < 0) {
+                    sb.append(pattern, i, pattern.length());
+                    break;
+                }
+                sb.append(pattern, i, at);
+                if (argIdx < args.length) {
+                    sb.append(args[argIdx++]);
+                } else {
+                    sb.append("{}");
+                }
+                i = at + 2;
+            }
+            return sb.toString();
+        }
+
+        java.util.List<String> warns() {
+            return java.util.Collections.unmodifiableList(warns);
+        }
+
+        int warnCount() {
+            return warns.size();
+        }
+    }
+
+    /** 造一个用 {@link RecordingLogger} 的插件实例。 */
+    static PerfScopeVelocity pluginWithRecordingLogger(ProxyServer server, RecordingLogger sink) {
+        return new PerfScopeVelocity(server, sink.build(), Path.of("target", "stub-data"));
+    }
 }
