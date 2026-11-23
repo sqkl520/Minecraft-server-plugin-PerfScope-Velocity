@@ -26,6 +26,43 @@ PerfScope 的 Velocity 代理侧：接收各 Paper 后端上报的性能摘要�
 
 ---
 
+## [Unreleased] — 2026-11-23 — `/pscope network` 的降级粒度从"整张表"收窄到"单个后端"
+
+> 上一轮的 `NetworkCommandTest` 里有一条**记录现状**的哨兵用例，钉住的正是这个缺口。
+> 本轮把它修掉，那条用例随之从"钉住整表降级"翻转成"钉住逐台跳过"。
+
+### Fixed — P1：一台后端注册信息有缺陷，会让整张面板变空
+
+**症状**：面板上所有后端一起显示「无数据」，而真实原因只是其中一台的注册信息不完整。
+
+**根因**：`NetworkCommand.expectedServers()` 把**整段循环**包在同一个 `try/catch(Exception)` 里：
+
+```java
+try {
+    List<String> ids = new ArrayList<>();
+    for (var registered : plugin.server().getAllServers()) {
+        String name = registered.getServerInfo().getName();   // 某台返回 null -> NPE
+        ...
+    }
+    return ids;
+} catch (Exception e) {
+    return Collections.emptyList();        // 连正常的那几台也一起没了
+}
+```
+
+**为什么这比崩溃更糟**：Velocity 上命令崩掉是"玩家执行后没有任何反应"，至少是个异常信号；
+而这里降级成的输出与"插件压根没装好 / `network.enabled` 为 false"**逐字相同**，
+服主会顺着这条线索去查配置、查通道转发、查后端有没有玩家——
+三个方向都是错的，而真正的线索（哪一台后端注册坏了）**在面板上彻底看不见**。
+
+**修法**：降级粒度改成两层——注册表整体读不出来（`velocity.toml` 损坏）时仍整体降级；
+单台 `getServerInfo()` 出问题只跳过那一台。
+
+**负向验证**（实测）：把 `try` 挪回循环外面之后，新用例立刻红，报错文本正是
+「后端 0 个：正常 0 ｜ 全网 TPS — ｜ 在线合计 —」——即整张面板变空。还原后 126 例全绿。
+
+---
+
 ## [Unreleased] — 独立验证第二批：年龄列回归、锚点漏清、ZWJ 破约、整行 UNKNOWN、时间戳下限
 
 > 这一批**修的是上一批引入的回归与遗留缺陷**。第一条是上一批的真回归，其余是独立验证
