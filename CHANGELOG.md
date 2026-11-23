@@ -26,6 +26,45 @@ PerfScope 的 Velocity 代理侧：接收各 Paper 后端上报的性能摘要�
 
 ---
 
+## [Unreleased] — 2026-11-24 — 文档套件补齐到与后端仓库对等
+
+> 后端仓库有 `README-EN` / `CONTRIBUTING` / `SECURITY` / `CLA` / `FAQ` 一整套，
+> 代理仓库只有 `README.md` 和 `CHANGELOG.md`。README 还缺语言跳转行与 badge 区，
+> 与后端仓库的约定不一致。
+
+### Added
+
+- `README-EN.md` —— 完整英文版，与中文版内容对等。
+- `CONTRIBUTING.md` / `CONTRIBUTING-EN.md` —— 以代理侧为准（Maven 构建、shade 后的 jar、
+  `tools/check-velocity-descriptor.mjs` 门禁），不照搬后端特有的 Bukkit / `/perfscope` 子命令。
+- `SECURITY.md` / `SECURITY-EN.md` —— **威胁模型按代理侧重写**，7 个章节全部是代理特有的：
+  通道双向可寻址（为什么只认 `ServerConnection`）、`server-id` 来源绑定、长度与字符过滤、
+  数值可信度、时间戳伪造与时钟不同步、网络输入必须有界、命令权限 fail-closed。
+- `CLA.md` —— 沿用后端文本（法律文本与项目无关）。
+
+### Changed
+
+- `README.md` 补上 `[English](README-EN.md) | 简体中文` 跳转行与 badge 区，
+  与后端仓库的版式一致。版本 badge 用 shields.io 的转义写法 `1.4.5--SNAPSHOT--fix4`。
+
+### Fixed — `CONTRIBUTING` 里的示例命令指向不存在的测试类
+
+两份 `CONTRIBUTING` 都把「运行单个测试类」举例成 `-Dtest=NetworkViewTest`，而这个类不存在
+（代理侧只有 `NetworkCommandTest` / `PerfScopeVelocityTest` / `ProtocolFixtureTest` / `SummaryTest`）。
+照着敲会得到 `No tests matching pattern`，把新人引向"我的环境坏了"这个错误结论。
+改成 `-Dtest=SummaryTest`，并实测确认能跑。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 7 份新文档检查「喵」 | 全部 0（面向用户文字不含该字） |
+| README badge 的「126 tests」 | 实测 126 例，属实 |
+| 文档里引用的状态名 / 列名 / 子命令 | 与 `NetworkView.State`、`NetworkRenderer.HEADERS`、`NetworkCommand` 逐一对照，一致 |
+| `CONTRIBUTING` 里的构建与门禁命令 | 实跑通过 |
+
+---
+
 ## [Unreleased] — 2026-11-23 — `/pscope network` 的降级粒度从"整张表"收窄到"单个后端"
 
 > 上一轮的 `NetworkCommandTest` 里有一条**记录现状**的哨兵用例，钉住的正是这个缺口。

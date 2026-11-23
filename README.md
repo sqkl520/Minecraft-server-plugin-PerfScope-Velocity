@@ -1,11 +1,36 @@
+[English](README-EN.md) | 简体中文
+
+<div align="center">
+
 # PerfScope-Velocity
 
-PerfScope 的 **Velocity 代理侧**：接收各后端（Paper）上报的性能摘要，用 `/pscope network` 一屏看全网。
+**PerfScope 的 Velocity 代理侧 —— 群组服一屏看全网**
+接收各后端（Paper）上报的性能摘要，用 `/pscope network` 看全部后端的 TPS / MSPT / 在线数
+
+![Version](https://img.shields.io/badge/version-1.4.5--SNAPSHOT--fix4-orange?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-Velocity%203.x-blue?style=flat-square)
+![Java](https://img.shields.io/badge/java-17-success?style=flat-square)
+![Tests](https://img.shields.io/badge/unit%20tests-126%20passing-brightgreen?style=flat-square)
+![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
+
+[![Build](https://github.com/sqkl520/Minecraft-server-plugin-PerfScope-Velocity/actions/workflows/build.yml/badge.svg)](https://github.com/sqkl520/Minecraft-server-plugin-PerfScope-Velocity/actions/workflows/build.yml)
+
+**零出站连接** · **只读** · **不写任何文件** —— 放进 `plugins/` 就能用
+
+**[⬇️ 下载最新版](https://github.com/sqkl520/Minecraft-server-plugin-PerfScope-Velocity/releases)** ·
+[问题反馈](https://github.com/sqkl520/Minecraft-server-plugin-PerfScope-Velocity/issues)
+
+</div>
 
 > **独立仓库**：<https://github.com/sqkl520/Minecraft-server-plugin-PerfScope-Velocity>
 >
 > 后端（Paper）插件在 <https://github.com/sqkl520/Minecraft-server-plugin-PerfScope>。
 > 两个仓库的 artifact 版本保持同步。
+
+> **版本以 [Releases 页](https://github.com/sqkl520/Minecraft-server-plugin-PerfScope-Velocity/releases) 为准。**
+> 徽章上的版本号取自 `pom.xml`，与 Releases 页对不上时**一律以 Releases 页为准**。
+> 所有发布都标为 Pre-release，因此 `/releases/latest` 不会指向它们，请从 Releases 列表页取最上面一条；
+> 文件名里 `fixN` 越大越新。徽章上的用例数是最近一次 `mvn test` 的实测值，会随版本变化。
 
 ## 它做什么
 
@@ -205,16 +230,20 @@ network:
   push-interval-seconds: 10
 ```
 
-**`server-id` 有两条硬限制，代理与后端两端同时校验（判据逐字一致）：**
+**`server-id` 有三条硬限制，代理与后端两端同时校验（判据逐字一致）：**
 
 | 限制 | 值 | 超限后果 |
 |---|---|---|
 | 长度 | ≤ **64** 个字符（按字符数，不按字节；中文一字算 1） | 后端**拒发**并告警；代理对越界包整包丢弃 |
 | 保留字 | 不能是 **`unknown`**（大小写敏感，`Unknown` 合法） | 同上 |
+| 字符 | 不能含控制符（C0 0x00–0x1F、C1 0x80–0x9F、DEL 0x7F）或 **`§`**（U+00A7） | 后端**拒发**并点出是哪个码点；代理对收到的包**剔除**这些字符后继续用 |
 
-后端在**发送前**就拦住，日志点名"长度 / 保留字"并给出实际字符数与上限——这正是为了修掉
+后端在**发送前**就拦住，日志点名"长度 / 保留字 / 含非法字符"并给出实际字符数与上限——这正是为了修掉
 早年的失败形态：超长 id 被代理静默丢弃，代理日志只说"无法解析的跨服摘要，请检查版本"，
 把服主引向一个完全无关的方向（两端版本不一致），照着查会彻底查错。
+
+> 为什么控制符也要在后端拦：代理侧会把它们**剔除**，于是 `survival\u0007` 与真正的 `survival`
+> 会塌成同一个 id——先上报的那一方抢注成功，真正的后端随后被判成冒充而**永久丢包**。
 
 > 长度上限 64 是**协议常量**，不是可调项。两端不能共享代码（一个 Paper 一个 Velocity），
 > 所以靠"同一个字面量 64"对接，两侧测试各钉一遍。
@@ -332,6 +361,15 @@ node tools/check-velocity-descriptor.mjs   # 校验 jar 里的描述符
 ```
 
 产物：`target/PerfScope-Velocity-<version>.jar`，丢进 Velocity 的 `plugins/` 目录。
+
+`mvn clean package` 会先跑单元测试，再把 Gson shade 进 jar（落点
+`cn.perfscope.velocity.shaded.gson`）；Velocity API 本身是 `provided`，绝不打进 jar。常用变体：
+
+```bash
+mvn test                         # 只跑测试
+mvn test -Dtest=SummaryTest      # 跑单个测试类
+mvn clean package -DskipTests    # 跳过测试打包
+```
 
 ## 那个 `resources-filtered` 目录是干什么的
 
