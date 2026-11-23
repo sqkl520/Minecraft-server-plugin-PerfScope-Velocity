@@ -11,7 +11,7 @@ TPS / MSPT / player count through `/pscope network`
 ![Version](https://img.shields.io/badge/version-1.4.5--SNAPSHOT--fix4-orange?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Velocity%203.x-blue?style=flat-square)
 ![Java](https://img.shields.io/badge/java-17-success?style=flat-square)
-![Tests](https://img.shields.io/badge/unit%20tests-126%20passing-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/unit%20tests-131%20passing-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
 
 [![Build](https://github.com/sqkl520/Minecraft-server-plugin-PerfScope-Velocity/actions/workflows/build.yml/badge.svg)](https://github.com/sqkl520/Minecraft-server-plugin-PerfScope-Velocity/actions/workflows/build.yml)
