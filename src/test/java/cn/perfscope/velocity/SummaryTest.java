@@ -823,6 +823,136 @@ class SummaryTest {
         assertEquals(NetworkRenderer.MAX_CELL_WIDTH, NetworkRenderer.displayWidth(cut));
     }
 
+    // ==================== 宽度上限的「数值」本身 ====================
+    //
+    // 上面几条（columnWidthsUseMaxAcrossRows / overlongServerIdIsTruncatedNotWidening /
+    // tableWidthIsBoundedWithoutRelyingOnCallOrder）全部引用 NetworkRenderer.MAX_CELL_WIDTH
+    // / MAX_ID_DISPLAY_WIDTH 来写断言。那是**自指**形状：把常量从 32 改成 64 或 1000，
+    // 断言跟着一起放宽，测试仍然全绿——实测正是如此（P1-X 的 3 条 SURVIVED）。
+    // 只有「改小」会红（32 → 8 让真实内容放不下），于是「只测了改小，没测上界」。
+    //
+    // 下面这一节的断言用**字面量**，与被测常量不共变。这与 SummaryPacket.MAX_SERVER_ID_LENGTH
+    // 的钉法同源（rejectsOverlongServerId 里那条 assertEquals(64, ...)）。
+
+    @Test
+    @DisplayName("宽度上限：单格 32 格是面板预算，不是随手写的数")
+    void cellWidthCapIsThePanelBudget() {
+        // 为什么是 32（读自 NetworkRenderer 的 javadoc 与真实内容实测）：
+        //   - 最长的**合法**内容是「数据年龄」格：`12分钟前（数字已冻结）` 实测 22 格
+        //     （看下面 absurdFutureAgeCellIsTruncatedToThirtyTwo 的 33 格反例）。
+        //   - 表头 `TPS(1m)` 是 7 格，后端名另由 MAX_ID_DISPLAY_WIDTH 管到 20 格。
+        //   - 留到 32 是给文案的小改留余量（例如「采集已停（数字已冻结）」），
+        //     同时保证整行不会被一格推成几百格：6 × 32 + 10（5 处两空格分隔）= 202 格。
+        // 这几句就是断言消息的全部意义：下一个人把它改成 64 时，看到的不是
+        // 「测试红了」，而是「你正在把整行上界从 202 格放到 394 格」。
+        assertEquals(32, NetworkRenderer.MAX_CELL_WIDTH,
+            "单格上限必须就是 32——这是「整行不超过 6 × 32 + 10 = 202 格」这个可断言性质的一半；"
+                + "改成 64 会让上界变成 394 格，面板在约 53 格的聊天框里折成多行，"
+                + "纵向对照失效（这正是 P1-X 要修的场景）");
+    }
+
+    @Test
+    @DisplayName("宽度上限：后端名 20 格是真实名字的余量，不是随手写的数")
+    void idDisplayWidthCapIsTheNameBudget() {
+        // 为什么是 20（读自 NetworkRenderer.MAX_ID_DISPLAY_WIDTH 的 javadoc）：
+        //   - 真实后端名（`survival-1`、`skyblock-asia-2`、`minigames-3`）都在 16 格以内，
+        //     实测 survival-1 = 10 格、skyblock-asia-2 = 15 格；20 留了一点余量。
+        //   - 再大就只是让每行更容易折行：这一列是全表最宽的固定开销。
+        //   - 20 格 = 20 个半角字符，或 10 个汉字。
+        // 它比 MAX_CELL_WIDTH 更紧，是因为后端名是**唯一**一个完全来自网络输入的列。
+        assertEquals(20, NetworkRenderer.MAX_ID_DISPLAY_WIDTH,
+            "后端名上限必须就是 20——真实名字最长 16 格（skyblock-asia-2 实测 15），"
+                + "20 是余量而不是「够大就行」；再放大只是让每行更容易在聊天框里折行");
+    }
+
+    @Test
+    @DisplayName("宽度上限：单格 200 格的内容被列宽总闸压到 32（行为，不只是常量）")
+    void overlongCellIsClampedToThirtyTwo() {
+        // 钉常量只能证明「这个数是 32」，证明不了「32 真的被执行」。
+        // 这里拿一格里塞 200 格的**合成行**（Row/Cell 是本包可见，测试在建它的
+        // 同一层），断言 columnWidths 产出的列宽恰好是字面量 32、且补完空格后宽度也是 32。
+        // 与 tableWidthIsBoundedWithoutRelyingOnCallOrder 的区别：那条用常量比，
+        // 这条用字面量比——常量改成 64 / 1000 时只有这条会红。
+        NetworkRenderer.Row absurd = new NetworkRenderer.Row(List.of(
+            new NetworkRenderer.Cell("m".repeat(200), NetworkRenderer.Level.OK),
+            new NetworkRenderer.Cell("正常", NetworkRenderer.Level.OK),
+            new NetworkRenderer.Cell("20.00", NetworkRenderer.Level.OK),
+            new NetworkRenderer.Cell("5.0", NetworkRenderer.Level.OK),
+            new NetworkRenderer.Cell("7", NetworkRenderer.Level.OK),
+            new NetworkRenderer.Cell("1秒前", NetworkRenderer.Level.OK)));
+        NetworkRenderer.ColumnLayout layout =
+            NetworkRenderer.columnWidths(List.of(absurd), NetworkRenderer.HEADERS);
+
+        assertEquals(32, layout.column(0),
+            "200 格的一列必须被封到字面量 32 格，实际是 " + layout.column(0)
+                + "——放大上限等于让一格把整行撑爆");
+        String painted = layout.render(0, 0, absurd.cells().get(0).text());
+        assertEquals(32, NetworkRenderer.displayWidth(painted),
+            "补完之后这一格必须恰好占 32 格，实际是 " + NetworkRenderer.displayWidth(painted));
+        assertTrue(painted.endsWith("…"),
+            "超宽被截断必须看得出来（省略号），不能悄悄剪短：" + painted);
+    }
+
+    @Test
+    @DisplayName("宽度上限：极端的未来时间戳把年龄格推到 33 格，仍被压回 32")
+    void absurdFutureAgeCellIsTruncatedToThirtyTwo() {
+        // 这条走**完整生产链路**（parse → onPacket → snapshot → renderOne → columnWidths），
+        // 不构造合成行。它证明 32 这个上限对真实内容也在生效，而不只是对合成输入。
+        //
+        // 实测：sentAt = collectedAt = 9e18 时，时间戳落在未来，年龄格渲染成
+        // `早 104166646990天（时间戳在未来）` = 33 格——比 32 多 1 格。这类格子的宽度
+        // 由「数字有几位」决定，上游的 UTF-16 闸门管不住，所以只能靠总闸兜。
+        long now = 1_700_000_000_000L;
+        long farFuture = 9_000_000_000_000_000_000L;
+        NetworkView view = new NetworkView();
+        view.onPacket(SummaryPacket.parse(json(
+            "{\"v\":1,\"kind\":\"summary\",\"server\":\"s\",\"sentAt\":" + farFuture
+                + ",\"collectedAt\":" + farFuture + ",\"alive\":true,\"players\":1,"
+                + "\"tps1m\":20.0,\"msptAvg\":5.0}")), now);
+
+        NetworkRenderer.Row row = NetworkRenderer.renderOne(view.snapshot(now, 10, List.of()).get(0));
+        String ageCell = row.cells().get(5).text();
+        // 前置条件只断言「超了上限」，不钉死 33 这个字面量：文案将来换个说法、宽 31 或 35
+        // 都还成立，这条用例仍然在测同一件事（超宽格必须被压回 32）。若哪天它不再超宽，
+        // 这条会以「此场景不再触发截断」报红——那是该换场景，而不是删断言。
+        assertTrue(NetworkRenderer.displayWidth(ageCell) > 32,
+            "这条用例的前提变了：极端未来时间戳下的年龄格必须超过 32 格才会触发总闸，"
+                + "实际是 " + NetworkRenderer.displayWidth(ageCell) + "：" + ageCell);
+        assertTrue(ageCell.endsWith("（时间戳在未来）"), "年龄格文案变了：" + ageCell);
+
+        NetworkRenderer.ColumnLayout layout = NetworkRenderer.columnWidths(List.of(row), NetworkRenderer.HEADERS);
+        assertEquals(32, layout.column(5),
+            "33 格的年龄格必须被总闸压回字面量 32 格，实际列宽是 " + layout.column(5));
+        String painted = layout.render(0, 5, ageCell);
+        assertEquals(32, NetworkRenderer.displayWidth(painted),
+            "补完后年龄格必须恰好 32 格，实际是 " + NetworkRenderer.displayWidth(painted));
+        assertTrue(painted.endsWith("…"),
+            "被剪短必须看得出来（省略号），否则读者会以为「（时间戳在未来）」还在：" + painted);
+    }
+
+    @Test
+    @DisplayName("宽度上限：64 字符的后端名（协议允许的最大值）渲染成 20 格，不随常量漂移")
+    void longestLegalServerIdRendersExactlyTwentyCells() {
+        // 64 是协议允许的最大 server-id 长度（SummaryPacket.MAX_SERVER_ID_LENGTH）。
+        // 它经过 idCell 后必须变成**字面量 20 格**：20 是显示宽度上限，
+        // 与 64 那个 UTF-16 长度上限是两个不同的判据（见 MAX_ID_DISPLAY_WIDTH 的 javadoc）。
+        // 用字面量而不是 MAX_ID_DISPLAY_WIDTH 来断言，常量改成 21 / 100 时这条会红。
+        long now = 1_700_000_000_000L;
+        NetworkView view = new NetworkView();
+        view.onPacket(okPacket("a".repeat(64), now - 1_000L, 20.0, 3), now);
+        NetworkRenderer.Row row = NetworkRenderer.renderOne(view.snapshot(now, 10, List.of()).get(0));
+
+        String idCell = row.cells().get(0).text();
+        assertEquals(20, NetworkRenderer.displayWidth(idCell),
+            "64 字符的名字必须被截成恰好 20 格，实际是 " + NetworkRenderer.displayWidth(idCell)
+                + "——这一列完全来自网络输入，宽一点整张表就跟着宽一大截");
+        assertTrue(idCell.endsWith("…"), "截断必须看得出来：" + idCell);
+
+        NetworkRenderer.ColumnLayout layout = NetworkRenderer.columnWidths(List.of(row), NetworkRenderer.HEADERS);
+        assertEquals(20, layout.column(0),
+            "第 1 列（后端名）必须恰好 20 格，实际是 " + layout.column(0));
+    }
+
     @Test
     @DisplayName("量级：tps1m = 1e308 当作没有值，整表列宽不受影响")
     void absurdTpsMagnitudeIsTreatedAsMissing() {

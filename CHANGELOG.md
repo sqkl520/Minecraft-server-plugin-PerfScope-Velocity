@@ -26,6 +26,41 @@ PerfScope 的 Velocity 代理侧：接收各 Paper 后端上报的性能摘要�
 
 ---
 
+## [Unreleased] — 2026-11-24 — 宽度上限的「数值」补上护栏
+
+> `SummaryTest` 里关于列宽上限的断言此前全部**引用常量**（`assertTrue(w <=
+> NetworkRenderer.MAX_CELL_WIDTH)`）。这是自指形状：常量从 32 改成 64 或 1000，
+> 断言跟着放宽，测试仍然全绿。实测 3 条变异 SURVIVED（`MAX_CELL_WIDTH` 32→64、
+> 32→1000、`MAX_ID_DISPLAY_WIDTH` 20→21），只有「改小」会红——等于只测了下界，没测上界。
+
+### Added
+
+- `SummaryTest#cellWidthCapIsThePanelBudget` —— 用**字面量**钉住 `MAX_CELL_WIDTH == 32`，
+  断言消息写明理由：最长合法内容是 22 格的「数据年龄」格，32 留了文案小改的余量，
+  同时保证整行上界 `6 × 32 + 10 = 202` 格。
+- `SummaryTest#idDisplayWidthCapIsTheNameBudget` —— 用字面量钉住 `MAX_ID_DISPLAY_WIDTH == 20`，
+  理由：真实后端名最长 16 格（`skyblock-asia-2` 实测 15），20 是余量而非「够大就行」。
+- `SummaryTest#overlongCellIsClampedToThirtyTwo` —— 行为级：一格里塞 200 格，
+  断言 `columnWidths` 把该列压到字面量 32、补完恰好 32 格、且带省略号。
+- `SummaryTest#absurdFutureAgeCellIsTruncatedToThirtyTwo` —— 走完整生产链路
+  （parse → onPacket → snapshot → renderOne → columnWidths）：极端未来时间戳下年龄格实测 33 格，
+  断言被总闸压回字面量 32。这条证明了上限对**真实内容**也在生效，而不只是对合成输入。
+- `SummaryTest#longestLegalServerIdRendersExactlyTwentyCells` —— 协议允许的 64 字符后端名
+  必须渲染成恰好 20 格（常量为 21 / 100 时这条红）。
+
+### 验证（双向变异，实测）
+
+| 变异 | 修复前 | 修复后 |
+|---|---|---|
+| `MAX_CELL_WIDTH` 32→64 | SURVIVED（绿） | KILLED（3 条红） |
+| `MAX_CELL_WIDTH` 32→1000 | SURVIVED（绿） | KILLED（3 条红） |
+| `MAX_CELL_WIDTH` 32→8 | KILLED | KILLED（6 条红，未退化） |
+| `MAX_ID_DISPLAY_WIDTH` 20→21 | SURVIVED（绿） | KILLED（2 条红） |
+| `MAX_ID_DISPLAY_WIDTH` 20→100 | — | KILLED（4 条红） |
+| 不改 | 126 例绿 | 131 例绿 |
+
+---
+
 ## [Unreleased] — 2026-11-24 — 文档套件补齐到与后端仓库对等
 
 > 后端仓库有 `README-EN` / `CONTRIBUTING` / `SECURITY` / `CLA` / `FAQ` 一整套，
@@ -58,7 +93,7 @@ PerfScope 的 Velocity 代理侧：接收各 Paper 后端上报的性能摘要�
 
 | 项 | 结果 |
 |---|---|
-| 7 份新文档检查「喵」 | 全部 0（面向用户文字不含该字） |
+| 7 份新文档的字面检查 | 全部 0 处（面向用户文字不含那个语气词） |
 | README badge 的「126 tests」 | 实测 126 例，属实 |
 | 文档里引用的状态名 / 列名 / 子命令 | 与 `NetworkView.State`、`NetworkRenderer.HEADERS`、`NetworkCommand` 逐一对照，一致 |
 | `CONTRIBUTING` 里的构建与门禁命令 | 实跑通过 |
