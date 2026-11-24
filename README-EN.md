@@ -160,11 +160,29 @@ other machine's timeline. Consequently:
 - **Backend 5 minutes fast**: no longer "always healthy". A just-sent packet reads OK, and 30 seconds
   after it stops the row turns "stale" as usual.
 - **Backend 5 minutes slow**: no longer "always stale". As long as it keeps reporting, it reads OK.
-- **Offset beyond 10 minutes**: not used for learning; that row shows "clock skew" — every age number
-  on such a machine is untrustworthy, and fixing NTP is more useful than having the panel guess.
+- **Offset beyond 10 minutes**: no longer used for learning — the correction is capped at 10 minutes,
+  and anything beyond that is not absorbed. Note this does **not** mean "beyond 10 minutes always
+  shows clock skew": the two thresholds are different (see below).
 - **Forged timestamps**: age is anchored at the moment the packet arrives, so a forgery buys at most
   one "0 seconds ago" at arrival and is stale 30 seconds later. Before the fix it could buy a
   **permanent** "healthy".
+
+**The actual predicates behind the "clock skew" state** (one per direction, different thresholds):
+
+| Direction | Threshold | Constant |
+|---|---|---|
+| Timestamp in the **future** | beyond **60 seconds** | `SummaryPacket.MAX_FUTURE_AHEAD_MS` |
+| Timestamp in the **past** | beyond **10 years** | `NetworkView.MAX_PLAUSIBLE_AGE_MS` |
+
+Why the two differ by so much: in the future direction, more than 60 seconds is already enough to
+rule out network latency, so the gate is tight. In the past direction it cannot be tight — real data
+may be seconds old right after a backend restart, or minutes old because of a network partition, so
+an hour-scale gate would produce false positives. The purpose of the 10-year figure is to catch
+**structural** errors such as a 1969 timestamp (a missing field used as zero), not to measure skew.
+
+Both directions report "clock skew" rather than "stale" because the wording has to be accurate: no
+empty server produces a 1969 timestamp, so saying "possibly empty" points the operator at "nobody is
+playing" when the thing to look at is that machine's clock.
 
 Network latency can only make the age larger (more conservative) by construction; it cannot be used
 to make data look fresher.
