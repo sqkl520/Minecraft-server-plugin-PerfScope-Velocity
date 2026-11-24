@@ -544,6 +544,15 @@ public final class NetworkView {
                 // 时间戳，写成「可能空服」等于把人指向"没人玩"，而真正该看的是那台机器的时钟。
                 s = State.CLOCK_SKEW;
                 issue = ClockIssue.PAST;
+                // 渲染层用 `-ahead` 表示"落后多少"，所以这里必须给**负值**。
+                //
+                // 这一行此前漏了，`shownAhead` 于是停在上面的初始值 0，
+                // `clockDetail` 走 PAST 分支时渲染成「落后 0秒（时间戳在过去）」——
+                // 方向是对的，量永远是 0，等于把这句诊断最有用的那一半丢了。
+                // 实测：collectedAt=1 与 collectedAt=现在-11年 都渲染成「落后 0秒」。
+                //
+                // 取负的 age：age 是"快照比到达时刻早多少"，正是该往前拨的量。
+                shownAhead = -age;
             } else if (dataAgeForGate > staleMs) {
                 s = State.STALE;
             } else {

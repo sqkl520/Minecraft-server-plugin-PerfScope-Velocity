@@ -160,9 +160,10 @@ other machine's timeline. Consequently:
 - **Backend 5 minutes fast**: no longer "always healthy". A just-sent packet reads OK, and 30 seconds
   after it stops the row turns "stale" as usual.
 - **Backend 5 minutes slow**: no longer "always stale". As long as it keeps reporting, it reads OK.
-- **Offset beyond 10 minutes**: no longer used for learning — the correction is capped at 10 minutes,
-  and anything beyond that is not absorbed. Note this does **not** mean "beyond 10 minutes always
-  shows clock skew": the two thresholds are different (see below).
+- **Offset beyond 10 minutes**: that sample is **discarded outright** and not used for learning (it is
+  not "clamped to 10 minutes"). Once it goes past, the correction falls back to 0 and the row's age
+  equals the full offset — in the **future** direction a residual over 60 seconds reads "clock skew";
+  in the **past** direction it usually lands on "stale".
 - **Forged timestamps**: age is anchored at the moment the packet arrives, so a forgery buys at most
   one "0 seconds ago" at arrival and is stale 30 seconds later. Before the fix it could buy a
   **permanent** "healthy".
@@ -171,18 +172,25 @@ other machine's timeline. Consequently:
 
 | Direction | Threshold | Constant |
 |---|---|---|
-| Timestamp in the **future** | beyond **60 seconds** | `SummaryPacket.MAX_FUTURE_AHEAD_MS` |
+| Timestamp in the **future** | residual **after** subtracting the learned offset exceeds **60 seconds** | `SummaryPacket.MAX_FUTURE_AHEAD_MS` |
 | Timestamp in the **past** | beyond **10 years** | `NetworkView.MAX_PLAUSIBLE_AGE_MS` |
 
-Why the two differ by so much: in the future direction, more than 60 seconds is already enough to
-rule out network latency, so the gate is tight. In the past direction it cannot be tight — real data
-may be seconds old right after a backend restart, or minutes old because of a network partition, so
-an hour-scale gate would produce false positives. The purpose of the 10-year figure is to catch
-**structural** errors such as a 1969 timestamp (a missing field used as zero), not to measure skew.
+Note the first row is a **residual**, not the absolute offset: a backend that is consistently 5 minutes
+fast has a near-zero residual once its offset is learned, so it reads OK — consistent with the bullet
+above. What the 60-second gate really catches is `collectedAt` and `sentAt` contradicting each other.
 
-Both directions report "clock skew" rather than "stale" because the wording has to be accurate: no
-empty server produces a 1969 timestamp, so saying "possibly empty" points the operator at "nobody is
-playing" when the thing to look at is that machine's clock.
+Why the past direction is as wide as 10 years: real data may be seconds old right after a backend
+restart, or minutes old because of a network partition, so an hour-scale gate would produce false
+positives. The 10-year figure catches **structural** errors — a positive but absurd timestamp such as
+`collectedAt=1` (1970-01-01T00:00:00.001Z) that cannot be a real measurement.
+
+Note this gate **does not** catch a *missing* timestamp: `collectedAt <= 0` is judged "stale" earlier,
+by a separate gate. Do not conflate the two.
+
+**The two past-direction gates have an order**: `COLLECTOR_DEAD` is judged before "too old" — the
+packets are still arriving and the backend says its collector is dead, which is more specific and more
+actionable than "the timestamp looks odd". So a machine with a dead collector reads "collector stopped"
+even if its timestamp is absurd, not "clock skew".
 
 Network latency can only make the age larger (more conservative) by construction; it cannot be used
 to make data look fresher.

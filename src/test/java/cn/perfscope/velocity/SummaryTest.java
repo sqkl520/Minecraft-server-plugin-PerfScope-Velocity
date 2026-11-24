@@ -2021,6 +2021,11 @@ class SummaryTest {
         assertFalse(ageCell.contains("498888小时前"),
             "荒谬年龄不该被当真渲染出来，实际：" + ageCell);
         assertTrue(ageCell.contains("落后"), "过去侧要写「落后 N」，实际：" + ageCell);
+        // 「落后」这个词恒真——「落后 0秒」也含它。这条断言存在的意义是「告诉服主往哪个方向拨、
+        // 差多少」，所以必须断言**量不是 0**。修复前 shownAhead 在 PAST 分支没被赋值，
+        // 渲染出来正是「落后 0秒（时间戳在过去）」：方向对、量永远是 0，最有用的那一半丢了。
+        assertFalse(ageCell.contains("落后 0秒"),
+            "过去侧必须给出真实的落后量，不能恒为 0（这正是 shownAhead 在 PAST 分支漏赋值时的输出），实际：" + ageCell);
 
         Double avg = NetworkView.averageTps1m(old.snapshot(now, 10, List.of()));
         assertNull(avg, "全网只剩这一台且它不可信，平均值必须是 null 而不是 20.00");

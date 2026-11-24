@@ -153,8 +153,10 @@ Not any more, and it is worth knowing how: the proxy **learns** each backend's c
   stops, like everyone else.
 - **Backend clock minutes slow** used to mean "permanently stale". Now it reads OK while it keeps
   reporting.
-- **Offset beyond ±10 minutes** is not learned; the row shows `时钟异常` (clock skew) instead. Every
-  age on such a machine is untrustworthy — fix NTP rather than have the panel guess.
+- **Offset beyond ±10 minutes**: that sample is discarded, not learned. Beyond roughly that point the
+  correction falls back to 0, so a fast backend shows `时钟异常` (clock skew) while a slow one usually
+  reads "stale". Either way the age on such a machine is untrustworthy — fix NTP rather than have the
+  panel guess.
 - The age cell then says "ahead 1h (timestamp in the future)" or "behind 3d (timestamp in the past)",
   i.e. which way to adjust. It never says "0 seconds ago", because that is exactly the sentence a
   forged timestamp is trying to buy.
@@ -446,8 +448,9 @@ network:
 - **后端快几分钟**：以前意味着"永久正常"（年龄恒被 clamp 到 0，死掉的后端一直绿）。现在刚到的包
   显示正常，停发 30 秒后照常变「数据过期」。
 - **后端慢几分钟**：以前意味着"永久过期"。现在只要它在正常上报，就显示「正常」。
-- **偏移超过 ±10 分钟**：不参与学习，该行显示「时钟异常」。那种机器上所有年龄都不可信——
-  去修 NTP，比让面板替你猜有用。
+- **偏移超过 ±10 分钟**：那条样本被丢弃、不参与学习。越过这个点之后校正值回到 0，于是**快**的机器
+  显示「时钟异常」、**慢**的机器通常显示「数据过期」。两种情况下年龄都不可信——去修 NTP，
+  比让面板替你猜有用。
 - 年龄格这时写「早 1小时（时间戳在未来）」或「落后 3天（时间戳在过去）」，也就是该往哪边调。
   它**绝不**写「0 秒前」，因为那正是伪造时间戳想换来的那句话。
 
