@@ -26,6 +26,45 @@ PerfScope 的 Velocity 代理侧：接收各 Paper 后端上报的性能摘要�
 
 ---
 
+## [Unreleased] — 2026-11-24 — 补上 `versions/` 目录（后端一直有，代理一直没有）
+
+> 后端仓库从 1.0.0 起就有 `versions/` 本地归档与 `.gitignore` 例外；代理仓库发布了三个版本
+> 却一次都没归档过。两个仓库的发布口径本该一致。
+
+### Added
+
+- `versions/README.md` —— 说明本目录是**本地**备份、JAR 不入库、以及「拿哪个 jar」。
+  `mvn clean package` 产出三个文件，只有不带 `-shaded` / `original-` 前缀的那个要装。
+- `.gitignore` 补上同款规则：
+
+  ```
+  /versions/*
+  !/versions/README.md
+  ```
+
+  **必须先排除目录内容是 `/versions/*` 而不是目录本身 `/versions/`**，否则 git 不会进入该目录，
+  任何 `!` 例外都失效。这条注释在后端的 `.gitignore` 里写了，代理这边照抄并注明出处。
+
+### 顺带记一个跨仓库的已知差异
+
+归档的是 **GitHub Release 附件的原始字节**，不是重新构建的产物。CI（Linux）与本机（Windows）
+构建出的 `pom.properties` 换行符不同（LF vs CRLF），整包 sha 因此不同而**内容等价**。
+
+后端仓库有 `tools/verify-release-artifact.mjs` 专门处理这件事（已认得这个差异，判
+`PASS (modulo line endings)`）。**本仓库没有对应的归档校验脚本**，`versions/` 目前只做本地备份。
+这是一处刻意的不对称：代理侧的产物是单个 shade jar，风险面比后端小得多；若将来需要，
+可以照搬后端的脚本。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| `versions/*.jar` 是否被忽略 | **是**（`git check-ignore` 命中 `.gitignore:10 *.jar`） |
+| `versions/README.md` 是否可入库 | 是（`git status` 显示为待添加） |
+| `check-velocity-descriptor` | PASS（jar 仍是 shade 前的那个） |
+
+---
+
 ## [Unreleased] — 2026-11-24 — README 把「学习窗口」与「判据阈值」混成了一句
 
 > 由实机验收清单独立发现，不是本轮改动引入的。
